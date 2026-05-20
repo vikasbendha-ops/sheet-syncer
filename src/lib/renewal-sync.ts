@@ -426,6 +426,28 @@ async function processSourceTab(
 
   const requests: sheets_v4.Schema$Request[] = [];
 
+  // Grid bookkeeping. `rowEndCol` is the exclusive rightmost column index
+  // we will touch (covers existing data + any newly appended target cols).
+  // `thisTabInfo` lets us inspect the sheet's grid + existing conditional
+  // formats. Sheets enforces that updateCells / repeatCell stay within the
+  // grid bounds, so if our writes extend past the current columnCount we
+  // must grow the grid FIRST in the same batch.
+  const rowEndCol = Math.max(nextAppendIdx, lastFilledIdx + 1);
+  const thisTabInfo = allSourceTabs.find(
+    (t) => t.properties?.sheetId === sheetId
+  );
+  const currentColumnCount =
+    thisTabInfo?.properties?.gridProperties?.columnCount ?? 0;
+  if (rowEndCol > currentColumnCount) {
+    requests.push({
+      appendDimension: {
+        sheetId,
+        dimension: "COLUMNS",
+        length: rowEndCol - currentColumnCount,
+      },
+    });
+  }
+
   // 1. Headers (only for newly-appended columns)
   for (const f of FIELDS) {
     if (!headerNeeded[f]) continue;
@@ -511,7 +533,6 @@ async function processSourceTab(
   //    a manual cell color from a previous static-paint run. Resetting
   //    once each sync run clears any stale red/yellow/green and lets the
   //    conditional rules below take full control of cell appearance.
-  const rowEndCol = Math.max(nextAppendIdx, lastFilledIdx + 1);
   if (outcomes.length > 0 && rowEndCol > 0) {
     requests.push({
       repeatCell: {
@@ -538,9 +559,6 @@ async function processSourceTab(
   //    install the four tier rules. Rules persist in the spreadsheet and
   //    Google re-evaluates them on every open + every cell edit — so the
   //    highlighting stays accurate daily without ever re-running the sync.
-  const thisTabInfo = allSourceTabs.find(
-    (t) => t.properties?.sheetId === sheetId
-  );
   const existingRules = thisTabInfo?.conditionalFormats ?? [];
   // Delete from highest index down so each delete leaves the remaining
   // indices stable.
