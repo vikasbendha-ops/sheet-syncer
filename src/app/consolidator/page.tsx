@@ -31,10 +31,6 @@ interface SectionResult {
   error?: string;
 }
 
-interface BatchResult {
-  sections: SectionResult[];
-}
-
 interface SourceState {
   url: string;
   tabs: string[];
@@ -84,14 +80,80 @@ async function fetchTabsForUrl(url: string): Promise<string[]> {
   return data.tabs ?? [];
 }
 
+function serializeSection(s: SectionState) {
+  return {
+    id: s.id,
+    name: s.name,
+    outputUrl: s.outputUrl,
+    outputTabName: s.outputTabName,
+    sources: s.sources
+      .filter((src) => src.url && src.selected.length > 0)
+      .map((src) => ({ url: src.url, tabs: src.selected })),
+  };
+}
+
+function validateSection(s: SectionState): string | null {
+  if (!s.outputUrl) {
+    return `Output spreadsheet URL is required.`;
+  }
+  if (!s.outputTabName.trim()) {
+    return `Output tab name is required.`;
+  }
+  const hasAnyTabs = s.sources.some(
+    (src) => src.url && src.selected.length > 0
+  );
+  if (!hasAnyTabs) {
+    return `At least one source spreadsheet with tabs selected is required.`;
+  }
+  return null;
+}
+
 export default function ConsolidatorPage() {
   const [sections, setSections] = useState<SectionState[]>([makeSection(0)]);
-  const [running, setRunning] = useState(false);
-  const [error, setError] = useState("");
-  const [result, setResult] = useState<BatchResult | null>(null);
+
+  // Per-section runtime state (keyed by section.id).
+  // Sections are independent — running one doesn't affect the others'
+  // result/error/loading state.
+  const [results, setResults] = useState<Map<string, SectionResult>>(
+    new Map()
+  );
+  const [errors, setErrors] = useState<Map<string, string>>(new Map());
+  const [runningSections, setRunningSections] = useState<Set<string>>(
+    new Set()
+  );
+
   const [hydrated, setHydrated] = useState(false);
   const [hasSaved, setHasSaved] = useState(false);
   const [noMasterSheet, setNoMasterSheet] = useState(false);
+
+  // ---------- Per-section state helpers ----------
+
+  function setSectionRunning(id: string, running: boolean) {
+    setRunningSections((prev) => {
+      const next = new Set(prev);
+      if (running) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }
+
+  function setSectionError(id: string, msg: string | null) {
+    setErrors((prev) => {
+      const next = new Map(prev);
+      if (msg) next.set(id, msg);
+      else next.delete(id);
+      return next;
+    });
+  }
+
+  function setSectionResult(id: string, result: SectionResult | null) {
+    setResults((prev) => {
+      const next = new Map(prev);
+      if (result) next.set(id, result);
+      else next.delete(id);
+      return next;
+    });
+  }
 
   // Hydrate from server on mount
   useEffect(() => {
@@ -105,7 +167,6 @@ export default function ConsolidatorPage() {
           const data = (await res.json()) as { sections: SavedSection[] };
           if (data.sections && data.sections.length > 0) {
             setHasSaved(true);
-            // Rehydrate state, then asynchronously refetch tabs for each source.
             const rehydrated: SectionState[] = data.sections.map(
               (s, idx): SectionState => ({
                 id: s.id || makeSection(idx).id,
@@ -237,8 +298,14 @@ export default function ConsolidatorPage() {
   function removeSection(idx: number) {
     setSections((prev) => {
       if (prev.length === 1) {
-        // Always keep at least one section — clear it instead of removing.
         return [makeSection(0)];
+      }
+      // Clean up runtime state for the removed section
+      const removed = prev[idx];
+      if (removed) {
+        setSectionResult(removed.id, null);
+        setSectionError(removed.id, null);
+        setSectionRunning(removed.id, false);
       }
       return prev.filter((_, i) => i !== idx);
     });
@@ -270,8 +337,8 @@ export default function ConsolidatorPage() {
   async function handleFetchTabs(sectionIdx: number, sourceIdx: number) {
     const src = sections[sectionIdx]?.sources[sourceIdx];
     if (!src?.url) return;
-    setResult(null);
-    setError("");
+    const section = sections[sectionIdx];
+    if (section) setSectionError(section.id, null);
     updateSource(sectionIdx, sourceIdx, { loading: true });
     try {
       const tabs = await fetchTabsForUrl(src.url);
@@ -281,7 +348,12 @@ export default function ConsolidatorPage() {
         loading: false,
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to fetch tabs");
+      if (section) {
+        setSectionError(
+          section.id,
+          err instanceof Error ? err.message : "Failed to fetch tabs"
+        );
+      }
       updateSource(sectionIdx, sourceIdx, {
         tabs: [],
         selected: [],
@@ -325,57 +397,32 @@ export default function ConsolidatorPage() {
   }
 
   async function handleClearSaved() {
-    setError("");
+    setErrors(new Map());
+    setResults(new Map());
     try {
       await fetch("/api/consolidator/config", { method: "DELETE" });
     } catch {
       // best-effort
     }
     setSections([makeSection(0)]);
-    setResult(null);
     setHasSaved(false);
   }
 
-  async function handleRun(e: React.FormEvent) {
-    e.preventDefault();
+  // ---------- Run handlers ----------
 
-    // Front-end validation: every section needs an outputUrl + at least one source with selected tabs.
-    for (let i = 0; i < sections.length; i++) {
-      const s = sections[i];
-      if (!s.outputUrl) {
-        setError(`Section "${s.name}" needs an Output spreadsheet URL.`);
-        return;
-      }
-      if (!s.outputTabName.trim()) {
-        setError(`Section "${s.name}" needs an Output tab name.`);
-        return;
-      }
-      const hasAnyTabs = s.sources.some(
-        (src) => src.url && src.selected.length > 0
-      );
-      if (!hasAnyTabs) {
-        setError(
-          `Section "${s.name}" needs at least one source spreadsheet with tabs selected.`
-        );
-        return;
-      }
+  /** Run a single section's consolidation. Independent from other sections. */
+  async function handleRunSection(idx: number) {
+    const section = sections[idx];
+    if (!section) return;
+    const validationError = validateSection(section);
+    if (validationError) {
+      setSectionError(section.id, validationError);
+      return;
     }
-
-    setError("");
-    setRunning(true);
-    setResult(null);
+    setSectionError(section.id, null);
+    setSectionRunning(section.id, true);
     try {
-      const payload = {
-        sections: sections.map((s) => ({
-          id: s.id,
-          name: s.name,
-          outputUrl: s.outputUrl,
-          outputTabName: s.outputTabName,
-          sources: s.sources
-            .filter((src) => src.url && src.selected.length > 0)
-            .map((src) => ({ url: src.url, tabs: src.selected })),
-        })),
-      };
+      const payload = { sections: [serializeSection(section)] };
       const res = await fetch("/api/consolidator", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -383,14 +430,69 @@ export default function ConsolidatorPage() {
       });
       const data = await res.json();
       if (!res.ok) {
-        setError(data.error || "Failed to run");
+        setSectionError(section.id, data.error || "Failed to run");
         return;
       }
-      setResult(data);
+      const sec = data.sections?.[0];
+      if (sec) {
+        setSectionResult(section.id, sec);
+      }
     } catch {
-      setError("Network error");
+      setSectionError(section.id, "Network error");
     } finally {
-      setRunning(false);
+      setSectionRunning(section.id, false);
+    }
+  }
+
+  /** Convenience: run every section sequentially in one batch call. */
+  async function handleRunAll(e: React.FormEvent) {
+    e.preventDefault();
+
+    // Validate each section. If any fails, surface the error inline on that
+    // section's card; abort the batch run.
+    let anyFailed = false;
+    for (const s of sections) {
+      const err = validateSection(s);
+      if (err) {
+        setSectionError(s.id, err);
+        anyFailed = true;
+      } else {
+        setSectionError(s.id, null);
+      }
+    }
+    if (anyFailed) return;
+
+    setRunningSections(new Set(sections.map((s) => s.id)));
+    try {
+      const payload = { sections: sections.map(serializeSection) };
+      const res = await fetch("/api/consolidator", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const msg = data.error || "Failed to run";
+        for (const s of sections) {
+          setSectionError(s.id, msg);
+        }
+        return;
+      }
+      const newResults = new Map<string, SectionResult>();
+      for (const r of (data.sections ?? []) as SectionResult[]) {
+        newResults.set(r.sectionId, r);
+      }
+      setResults((prev) => {
+        const merged = new Map(prev);
+        for (const [k, v] of newResults) merged.set(k, v);
+        return merged;
+      });
+    } catch {
+      for (const s of sections) {
+        setSectionError(s.id, "Network error");
+      }
+    } finally {
+      setRunningSections(new Set());
     }
   }
 
@@ -409,9 +511,10 @@ export default function ConsolidatorPage() {
           case-insensitively. Rows are deduped by{" "}
           <code className="bg-card px-1 rounded">Email</code>; when the same
           email appears more than once, the first non-blank value per column
-          wins (so a column blank in one source picks up its value from
-          another). Add multiple sections to run several consolidations one
-          after another.
+          wins. Each section is independent — use its own{" "}
+          <span className="font-medium">Run section</span> button, or hit{" "}
+          <span className="font-medium">Run all</span> at the bottom to do
+          them in one go.
         </p>
       </div>
 
@@ -438,13 +541,16 @@ export default function ConsolidatorPage() {
         </div>
       )}
 
-      <form onSubmit={handleRun} className="space-y-5">
+      <form onSubmit={handleRunAll} className="space-y-5">
         {sections.map((section, sIdx) => (
           <SectionCard
             key={section.id}
             section={section}
             index={sIdx}
             total={sections.length}
+            result={results.get(section.id) ?? null}
+            error={errors.get(section.id) ?? null}
+            running={runningSections.has(section.id)}
             onChangeSection={(patch) => updateSection(sIdx, patch)}
             onRemove={() => removeSection(sIdx)}
             onAddSource={() => addSource(sIdx)}
@@ -455,6 +561,7 @@ export default function ConsolidatorPage() {
             onFetchTabs={(srcIdx) => handleFetchTabs(sIdx, srcIdx)}
             onToggleTab={(srcIdx, tab) => toggleTab(sIdx, srcIdx, tab)}
             onSelectAll={(srcIdx, all) => selectAllTabs(sIdx, srcIdx, all)}
+            onRunSection={() => handleRunSection(sIdx)}
           />
         ))}
 
@@ -467,34 +574,19 @@ export default function ConsolidatorPage() {
             + Add section
           </button>
 
-          {error && (
-            <p className="text-sm text-danger bg-danger/10 rounded-md px-3 py-2 flex-1">
-              {error}
-            </p>
-          )}
-
-          <button
-            type="submit"
-            disabled={running}
-            className="bg-primary text-white px-5 py-2 rounded-md text-sm font-medium hover:bg-primary-hover disabled:opacity-50 transition-colors cursor-pointer"
-          >
-            {running
-              ? "Running..."
-              : sections.length === 1
-                ? "Run consolidator"
+          {sections.length > 1 && (
+            <button
+              type="submit"
+              disabled={runningSections.size > 0}
+              className="bg-primary text-white px-5 py-2 rounded-md text-sm font-medium hover:bg-primary-hover disabled:opacity-50 transition-colors cursor-pointer"
+            >
+              {runningSections.size > 0
+                ? "Running..."
                 : `Run all ${sections.length} sections`}
-          </button>
+            </button>
+          )}
         </div>
       </form>
-
-      {result && (
-        <div className="space-y-3">
-          <h2 className="font-medium">Results</h2>
-          {result.sections.map((r, i) => (
-            <ResultCard key={r.sectionId + i} result={r} />
-          ))}
-        </div>
-      )}
     </div>
   );
 }
@@ -505,6 +597,9 @@ function SectionCard({
   section,
   index,
   total,
+  result,
+  error,
+  running,
   onChangeSection,
   onRemove,
   onAddSource,
@@ -513,10 +608,14 @@ function SectionCard({
   onFetchTabs,
   onToggleTab,
   onSelectAll,
+  onRunSection,
 }: {
   section: SectionState;
   index: number;
   total: number;
+  result: SectionResult | null;
+  error: string | null;
+  running: boolean;
   onChangeSection: (patch: Partial<SectionState>) => void;
   onRemove: () => void;
   onAddSource: () => void;
@@ -525,6 +624,7 @@ function SectionCard({
   onFetchTabs: (sourceIdx: number) => void;
   onToggleTab: (sourceIdx: number, tab: string) => void;
   onSelectAll: (sourceIdx: number, all: boolean) => void;
+  onRunSection: () => void;
 }) {
   return (
     <div className="bg-card border border-border rounded-lg p-5 space-y-5">
@@ -610,6 +710,135 @@ function SectionCard({
           tab in the chosen output spreadsheet.
         </p>
       </div>
+
+      {/* Per-section Run + error */}
+      <div className="border-t border-border pt-4 flex items-center justify-between gap-3 flex-wrap">
+        {error ? (
+          <p className="text-sm text-danger bg-danger/10 rounded-md px-3 py-2 flex-1 min-w-0">
+            {error}
+          </p>
+        ) : (
+          <span className="text-xs text-muted">
+            Runs this section only. Other sections are untouched.
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={onRunSection}
+          disabled={running}
+          className="bg-primary text-white px-4 py-2 rounded-md text-sm font-medium hover:bg-primary-hover disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
+        >
+          {running ? "Running..." : "Run section"}
+        </button>
+      </div>
+
+      {/* Inline result for this section */}
+      {result && <InlineResult result={result} />}
+    </div>
+  );
+}
+
+// ---------- Inline result block (rendered inside SectionCard) ----------
+
+function InlineResult({ result }: { result: SectionResult }) {
+  const failed = !!result.error;
+  return (
+    <div
+      className={`border-t pt-4 ${
+        failed ? "border-danger/30" : "border-border"
+      }`}
+    >
+      <div className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-2 mb-3">
+        <h3 className="font-medium text-sm">Last run</h3>
+        {result.outputSpreadsheetUrl && (
+          <a
+            href={result.outputSpreadsheetUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-sm text-primary hover:underline font-medium"
+          >
+            Open output →
+          </a>
+        )}
+      </div>
+
+      {failed ? (
+        <p className="text-sm text-danger bg-danger/10 rounded-md px-3 py-2">
+          {result.error}
+        </p>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-sm">
+            <Stat label="Source rows" value={result.totalSourceRows} />
+            <Stat label="Unique" value={result.uniqueRows} accent="success" />
+            <Stat
+              label="Duplicates merged"
+              value={result.duplicatesMerged}
+              accent="muted"
+            />
+            <Stat
+              label="Rows w/o email"
+              value={result.rowsWithoutEmail}
+              accent={result.rowsWithoutEmail > 0 ? "danger" : "muted"}
+            />
+            <Stat
+              label="Columns"
+              value={result.totalColumns}
+              accent="muted"
+            />
+          </div>
+
+          <div className="space-y-3 mt-3">
+            {result.sources.map((src, i) => (
+              <div key={i} className="border-t border-border pt-3">
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <a
+                    href={src.spreadsheetUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs text-primary hover:underline truncate"
+                  >
+                    {src.spreadsheetUrl}
+                  </a>
+                </div>
+                {src.error ? (
+                  <p className="text-xs text-danger">{src.error}</p>
+                ) : (
+                  <div className="space-y-1">
+                    {src.tabs.map((t, j) => (
+                      <div
+                        key={j}
+                        className="flex flex-col gap-0.5 text-xs py-1"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-medium">{t.tabName}</span>
+                          {t.error ? (
+                            <span className="text-danger">{t.error}</span>
+                          ) : (
+                            <span className="text-muted">
+                              {t.rowsWithEmail} w/ email ·{" "}
+                              {t.rowsWithoutEmail} w/o · {t.totalRows} total
+                              {t.columnsContributed > 0 && (
+                                <>
+                                  {" "}·{" "}
+                                  <span className="text-primary">
+                                    +{t.columnsContributed} col
+                                    {t.columnsContributed === 1 ? "" : "s"}
+                                  </span>
+                                </>
+                              )}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -719,118 +948,7 @@ function SourceRow({
   );
 }
 
-// ---------- Result card ----------
-
-function ResultCard({ result }: { result: SectionResult }) {
-  const failed = !!result.error;
-  return (
-    <div
-      className={`border rounded-lg p-5 space-y-4 ${
-        failed
-          ? "bg-danger/5 border-danger/30"
-          : "bg-card border-border"
-      }`}
-    >
-      <div className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-2">
-        <div>
-          <h3 className="font-medium">{result.sectionName}</h3>
-          <p className="text-xs text-muted">
-            Output tab:{" "}
-            <code className="bg-background px-1 rounded">
-              {result.outputTabName}
-            </code>
-          </p>
-        </div>
-        {result.outputSpreadsheetUrl && (
-          <a
-            href={result.outputSpreadsheetUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-sm text-primary hover:underline font-medium"
-          >
-            Open output →
-          </a>
-        )}
-      </div>
-
-      {failed ? (
-        <p className="text-sm text-danger">{result.error}</p>
-      ) : (
-        <>
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-sm">
-            <Stat label="Source rows" value={result.totalSourceRows} />
-            <Stat label="Unique" value={result.uniqueRows} accent="success" />
-            <Stat
-              label="Duplicates merged"
-              value={result.duplicatesMerged}
-              accent="muted"
-            />
-            <Stat
-              label="Rows w/o email"
-              value={result.rowsWithoutEmail}
-              accent={result.rowsWithoutEmail > 0 ? "danger" : "muted"}
-            />
-            <Stat
-              label="Columns"
-              value={result.totalColumns}
-              accent="muted"
-            />
-          </div>
-
-          <div className="space-y-3">
-            {result.sources.map((src, i) => (
-              <div key={i} className="border-t border-border pt-3">
-                <div className="flex items-center justify-between gap-2 mb-1">
-                  <a
-                    href={src.spreadsheetUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-primary hover:underline truncate"
-                  >
-                    {src.spreadsheetUrl}
-                  </a>
-                </div>
-                {src.error ? (
-                  <p className="text-xs text-danger">{src.error}</p>
-                ) : (
-                  <div className="space-y-1">
-                    {src.tabs.map((t, j) => (
-                      <div
-                        key={j}
-                        className="flex flex-col gap-0.5 text-xs py-1"
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-medium">{t.tabName}</span>
-                          {t.error ? (
-                            <span className="text-danger">{t.error}</span>
-                          ) : (
-                            <span className="text-muted">
-                              {t.rowsWithEmail} w/ email ·{" "}
-                              {t.rowsWithoutEmail} w/o · {t.totalRows} total
-                              {t.columnsContributed > 0 && (
-                                <>
-                                  {" "}·{" "}
-                                  <span className="text-primary">
-                                    +{t.columnsContributed} col
-                                    {t.columnsContributed === 1 ? "" : "s"}
-                                  </span>
-                                </>
-                              )}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
+// ---------- Reusable stat tile ----------
 
 function Stat({
   label,
