@@ -7,7 +7,7 @@ interface TabResult {
   totalRows: number;
   rowsWithEmail: number;
   rowsWithoutEmail: number;
-  missingColumns: string[];
+  columnsContributed: number;
   error?: string;
 }
 
@@ -26,6 +26,7 @@ interface SectionResult {
   uniqueRows: number;
   duplicatesMerged: number;
   rowsWithoutEmail: number;
+  totalColumns: number;
   sources: SourceResult[];
   error?: string;
 }
@@ -61,8 +62,6 @@ interface SavedSection {
   outputUrl: string;
   outputTabName: string;
 }
-
-const EXPECTED_COLUMNS = ["Nome", "Cognome", "Email", "Telefono Cellulare"];
 
 function makeSourceState(url = "", selected: string[] = []): SourceState {
   return { url, tabs: [], selected, loading: false };
@@ -404,15 +403,15 @@ export default function ConsolidatorPage() {
         <p className="text-muted text-sm mt-1">
           Each <span className="font-medium">section</span> merges rows from
           one or more source spreadsheets (each with its own picked tabs) and
-          writes a single output tab into the spreadsheet you choose. Reads{" "}
-          {EXPECTED_COLUMNS.map((c, i) => (
-            <span key={c}>
-              <code className="bg-card px-1 rounded">{c}</code>
-              {i < EXPECTED_COLUMNS.length - 1 ? ", " : ""}
-            </span>
-          ))}{" "}
-          and dedupes by email (rows with a phone number win). Add multiple
-          sections to run several consolidations one after another.
+          writes a single output tab into the spreadsheet you choose. The
+          output is the <span className="font-medium">union of every column</span>{" "}
+          seen across all picked tabs — first-seen order, headers matched
+          case-insensitively. Rows are deduped by{" "}
+          <code className="bg-card px-1 rounded">Email</code>; when the same
+          email appears more than once, the first non-blank value per column
+          wins (so a column blank in one source picks up its value from
+          another). Add multiple sections to run several consolidations one
+          after another.
         </p>
       </div>
 
@@ -758,7 +757,7 @@ function ResultCard({ result }: { result: SectionResult }) {
         <p className="text-sm text-danger">{result.error}</p>
       ) : (
         <>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-sm">
             <Stat label="Source rows" value={result.totalSourceRows} />
             <Stat label="Unique" value={result.uniqueRows} accent="success" />
             <Stat
@@ -770,6 +769,11 @@ function ResultCard({ result }: { result: SectionResult }) {
               label="Rows w/o email"
               value={result.rowsWithoutEmail}
               accent={result.rowsWithoutEmail > 0 ? "danger" : "muted"}
+            />
+            <Stat
+              label="Columns"
+              value={result.totalColumns}
+              accent="muted"
             />
           </div>
 
@@ -803,14 +807,18 @@ function ResultCard({ result }: { result: SectionResult }) {
                             <span className="text-muted">
                               {t.rowsWithEmail} w/ email ·{" "}
                               {t.rowsWithoutEmail} w/o · {t.totalRows} total
+                              {t.columnsContributed > 0 && (
+                                <>
+                                  {" "}·{" "}
+                                  <span className="text-primary">
+                                    +{t.columnsContributed} col
+                                    {t.columnsContributed === 1 ? "" : "s"}
+                                  </span>
+                                </>
+                              )}
                             </span>
                           )}
                         </div>
-                        {t.missingColumns.length > 0 && !t.error && (
-                          <span className="text-danger">
-                            Missing columns: {t.missingColumns.join(", ")}
-                          </span>
-                        )}
                       </div>
                     ))}
                   </div>
