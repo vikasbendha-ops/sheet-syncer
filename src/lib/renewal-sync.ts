@@ -8,8 +8,37 @@ import { withRetry } from "./retry";
 import { sheets_v4 } from "googleapis";
 
 const HEADER_BG = { red: 0.93, green: 0.93, blue: 0.96 };
-const RED_BG = { red: 1.0, green: 0.82, blue: 0.82 };
 const WHITE_BG = { red: 1.0, green: 1.0, blue: 1.0 };
+
+// Renewal-proximity row tiers (background + text color)
+const LIGHT_GREEN_BG = { red: 0.78, green: 0.92, blue: 0.78 }; // 15-30 days
+const LIGHT_YELLOW_BG = { red: 1.0, green: 0.95, blue: 0.7 }; // 5-14 days
+const LIGHT_RED_BG = { red: 1.0, green: 0.82, blue: 0.82 }; // 0-4 days
+const DARK_RED_BG = { red: 0.78, green: 0.1, blue: 0.1 }; // past
+const BLACK_TEXT = { red: 0, green: 0, blue: 0 };
+const WHITE_TEXT = { red: 1, green: 1, blue: 1 };
+
+type RenewalTier = "past" | "imminent" | "soon" | "later" | "none";
+
+function tierBg(tier: RenewalTier) {
+  switch (tier) {
+    case "past":
+      return DARK_RED_BG;
+    case "imminent":
+      return LIGHT_RED_BG;
+    case "soon":
+      return LIGHT_YELLOW_BG;
+    case "later":
+      return LIGHT_GREEN_BG;
+    case "none":
+    default:
+      return WHITE_BG;
+  }
+}
+
+function tierText(tier: RenewalTier) {
+  return tier === "past" ? WHITE_TEXT : BLACK_TEXT;
+}
 
 const FIELDS = ["phone", "courseName", "startDate", "renewalDate", "setterAssigned"] as const;
 type FieldKey = (typeof FIELDS)[number];
@@ -116,12 +145,29 @@ function parseFlexibleDate(raw: string): Date | null {
   return null;
 }
 
-function isPastDate(raw: string): boolean {
+/**
+ * Classify a renewal date into one of five proximity tiers relative to today.
+ *  past     — renewal already happened (date < today)
+ *  imminent — renewal happens today or in the next 4 days (0-4 days)
+ *  soon     — renewal in 5-14 days
+ *  later    — renewal in 15-30 days
+ *  none     — no parseable date, or more than 30 days away
+ */
+function computeRenewalTier(raw: string): RenewalTier {
   const d = parseFlexibleDate(raw);
-  if (!d) return false;
+  if (!d) return "none";
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  return d.getTime() < today.getTime();
+  const target = new Date(d);
+  target.setHours(0, 0, 0, 0);
+  const diffDays = Math.floor(
+    (target.getTime() - today.getTime()) / 86400000
+  );
+  if (diffDays < 0) return "past";
+  if (diffDays <= 4) return "imminent";
+  if (diffDays <= 14) return "soon";
+  if (diffDays <= 30) return "later";
+  return "none";
 }
 
 async function buildLookupMap(
@@ -292,7 +338,7 @@ async function processSourceTab(
     email: string | null;
     matched: boolean;
     data: LookupData | null;
-    renewalPast: boolean;
+    tier: RenewalTier;
   }
   const outcomes: RowOutcome[] = [];
   let matched = 0;
@@ -303,24 +349,24 @@ async function processSourceTab(
   for (let i = 0; i < emailRows.length; i++) {
     const raw = emailRows[i]?.[0];
     if (!raw) {
-      outcomes.push({ email: null, matched: false, data: null, renewalPast: false });
+      outcomes.push({ email: null, matched: false, data: null, tier: "none" });
       continue;
     }
     const email = normalizeEmail(String(raw));
     if (!email) {
-      outcomes.push({ email: null, matched: false, data: null, renewalPast: false });
+      outcomes.push({ email: null, matched: false, data: null, tier: "none" });
       continue;
     }
     totalRows++;
     const data = lookupMap.get(email) ?? null;
     if (data) {
       matched++;
-      const renewalPast = isPastDate(data.renewalDate);
-      if (renewalPast) pastRenewals++;
-      outcomes.push({ email, matched: true, data, renewalPast });
+      const tier = computeRenewalTier(data.renewalDate);
+      if (tier === "past") pastRenewals++;
+      outcomes.push({ email, matched: true, data, tier });
     } else {
       unmatched++;
-      outcomes.push({ email, matched: false, data: null, renewalPast: false });
+      outcomes.push({ email, matched: false, data: null, tier: "none" });
     }
   }
 
@@ -351,32 +397,66 @@ async function processSourceTab(
     });
   }
 
-  // 2. Per-field column writes (value + background)
+  // 2. Per-field column writes — VALUES ONLY. Background is owned by the
+  //    row-paint pass below so the whole row (existing + appended columns)
+  //    shares one tier color.
   if (outcomes.length > 0) {
     for (const f of FIELDS) {
       requests.push({
         updateCells: {
-          rows: outcomes.map((o) => {
-            const value = o.data ? o.data[f] : "";
-            const background =
-              f === "renewalDate" && o.renewalPast ? RED_BG : WHITE_BG;
-            return {
-              values: [
-                {
-                  userEnteredValue: { stringValue: value },
-                  userEnteredFormat: { backgroundColor: background },
-                },
-              ],
-            };
-          }),
-          fields: "userEnteredValue,userEnteredFormat.backgroundColor",
+          rows: outcomes.map((o) => ({
+            values: [
+              {
+                userEnteredValue: { stringValue: o.data ? o.data[f] : "" },
+              },
+            ],
+          })),
+          fields: "userEnteredValue",
           start: { sheetId, rowIndex: 1, columnIndex: targetCol[f] },
         },
       });
     }
   }
 
-  const CHUNK_SIZE = 5;
+  // 3. Row-paint pass — highlight every data row from column A to the last
+  //    relevant column based on the renewal-date proximity tier:
+  //      past     → dark red bg, white text
+  //      imminent → light red bg
+  //      soon     → light yellow bg
+  //      later    → light green bg
+  //      none     → white bg (resets any stale color from prior runs)
+  //
+  //    Text color is always set explicitly so a row that was "past" last
+  //    run (white text) doesn't keep white text after it changes tier.
+  const rowEndCol = Math.max(nextAppendIdx, lastFilledIdx + 1);
+  if (outcomes.length > 0 && rowEndCol > 0) {
+    for (let i = 0; i < outcomes.length; i++) {
+      const o = outcomes[i];
+      requests.push({
+        repeatCell: {
+          range: {
+            sheetId,
+            startRowIndex: i + 1, // skip header row 0
+            endRowIndex: i + 2,
+            startColumnIndex: 0,
+            endColumnIndex: rowEndCol,
+          },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: tierBg(o.tier),
+              textFormat: { foregroundColor: tierText(o.tier) },
+            },
+          },
+          fields:
+            "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.foregroundColor",
+        },
+      });
+    }
+  }
+
+  // Row-paint adds N requests for an N-row tab; bumping chunk size keeps
+  // total round-trips reasonable on large sheets without risking rate limits.
+  const CHUNK_SIZE = 25;
   for (let i = 0; i < requests.length; i += CHUNK_SIZE) {
     await withRetry(() =>
       sheets.spreadsheets.batchUpdate({
