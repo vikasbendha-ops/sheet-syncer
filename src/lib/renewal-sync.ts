@@ -18,26 +18,25 @@ const DARK_RED_BG = { red: 0.78, green: 0.1, blue: 0.1 }; // past
 const BLACK_TEXT = { red: 0, green: 0, blue: 0 };
 const WHITE_TEXT = { red: 1, green: 1, blue: 1 };
 
+// The tier classification is still computed per row so we can count
+// pastRenewals in the result summary, but the actual coloring is now done
+// by native Google Sheets conditional-format rules installed below — not by
+// painting cell backgrounds directly. That means the highlighting refreshes
+// automatically every day (and on every cell edit) without re-running sync.
 type RenewalTier = "past" | "imminent" | "soon" | "later" | "none";
 
-function tierBg(tier: RenewalTier) {
-  switch (tier) {
-    case "past":
-      return DARK_RED_BG;
-    case "imminent":
-      return LIGHT_RED_BG;
-    case "soon":
-      return LIGHT_YELLOW_BG;
-    case "later":
-      return LIGHT_GREEN_BG;
-    case "none":
-    default:
-      return WHITE_BG;
-  }
-}
+// Google Sheets serial date epoch: 1899-12-30 (anchored to absorb the
+// historical Lotus 1-2-3 leap-year-1900 bug). Using UTC-based math so the
+// server's timezone never shifts the result by ±1 day.
+const SHEETS_DATE_EPOCH_UTC_MS = Date.UTC(1899, 11, 30);
 
-function tierText(tier: RenewalTier) {
-  return tier === "past" ? WHITE_TEXT : BLACK_TEXT;
+function toSheetsDateSerial(d: Date): number {
+  const y = d.getFullYear();
+  const m = d.getMonth();
+  const day = d.getDate();
+  return Math.floor(
+    (Date.UTC(y, m, day) - SHEETS_DATE_EPOCH_UTC_MS) / 86400000
+  );
 }
 
 const FIELDS = ["phone", "courseName", "startDate", "renewalDate", "setterAssigned"] as const;
@@ -397,62 +396,178 @@ async function processSourceTab(
     });
   }
 
-  // 2. Per-field column writes — VALUES ONLY. Background is owned by the
-  //    row-paint pass below so the whole row (existing + appended columns)
-  //    shares one tier color.
+  // 2. Per-field column writes.
+  //    Renewal Date is written as a REAL date (numberValue + DATE number
+  //    format) when parseable, so the native conditional-formatting rules
+  //    below can compare it directly with TODAY(). Unparseable values fall
+  //    back to a string write. All other fields are written as strings.
   if (outcomes.length > 0) {
     for (const f of FIELDS) {
+      const isRenewalDate = f === "renewalDate";
       requests.push({
         updateCells: {
-          rows: outcomes.map((o) => ({
-            values: [
-              {
-                userEnteredValue: { stringValue: o.data ? o.data[f] : "" },
-              },
-            ],
-          })),
-          fields: "userEnteredValue",
+          rows: outcomes.map((o) => {
+            const raw = o.data ? o.data[f] : "";
+
+            if (isRenewalDate && raw) {
+              const parsed = parseFlexibleDate(raw);
+              if (parsed) {
+                return {
+                  values: [
+                    {
+                      userEnteredValue: {
+                        numberValue: toSheetsDateSerial(parsed),
+                      },
+                      userEnteredFormat: {
+                        numberFormat: { type: "DATE", pattern: "dd/mm/yyyy" },
+                      },
+                    },
+                  ],
+                };
+              }
+            }
+
+            return {
+              values: [
+                {
+                  userEnteredValue: { stringValue: raw },
+                  ...(isRenewalDate
+                    ? {
+                        // Clear date format so a previously formatted cell
+                        // doesn't render "" as a number.
+                        userEnteredFormat: { numberFormat: { type: "TEXT" } },
+                      }
+                    : {}),
+                },
+              ],
+            };
+          }),
+          fields: isRenewalDate
+            ? "userEnteredValue,userEnteredFormat.numberFormat"
+            : "userEnteredValue",
           start: { sheetId, rowIndex: 1, columnIndex: targetCol[f] },
         },
       });
     }
   }
 
-  // 3. Row-paint pass — highlight every data row from column A to the last
-  //    relevant column based on the renewal-date proximity tier:
-  //      past     → dark red bg, white text
-  //      imminent → light red bg
-  //      soon     → light yellow bg
-  //      later    → light green bg
-  //      none     → white bg (resets any stale color from prior runs)
-  //
-  //    Text color is always set explicitly so a row that was "past" last
-  //    run (white text) doesn't keep white text after it changes tier.
+  // 3. Reset background to white + text to black across the data range.
+  //    Native conditional rules can only ADD formatting — they can't undo
+  //    a manual cell color from a previous static-paint run. Resetting
+  //    once each sync run clears any stale red/yellow/green and lets the
+  //    conditional rules below take full control of cell appearance.
   const rowEndCol = Math.max(nextAppendIdx, lastFilledIdx + 1);
   if (outcomes.length > 0 && rowEndCol > 0) {
-    for (let i = 0; i < outcomes.length; i++) {
-      const o = outcomes[i];
-      requests.push({
-        repeatCell: {
-          range: {
-            sheetId,
-            startRowIndex: i + 1, // skip header row 0
-            endRowIndex: i + 2,
-            startColumnIndex: 0,
-            endColumnIndex: rowEndCol,
+    requests.push({
+      repeatCell: {
+        range: {
+          sheetId,
+          startRowIndex: 1,
+          endRowIndex: outcomes.length + 1,
+          startColumnIndex: 0,
+          endColumnIndex: rowEndCol,
+        },
+        cell: {
+          userEnteredFormat: {
+            backgroundColor: WHITE_BG,
+            textFormat: { foregroundColor: BLACK_TEXT },
           },
-          cell: {
-            userEnteredFormat: {
-              backgroundColor: tierBg(o.tier),
-              textFormat: { foregroundColor: tierText(o.tier) },
+        },
+        fields:
+          "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.foregroundColor",
+      },
+    });
+  }
+
+  // 4. Wipe any existing conditional-format rules on this sheet, then
+  //    install the four tier rules. Rules persist in the spreadsheet and
+  //    Google re-evaluates them on every open + every cell edit — so the
+  //    highlighting stays accurate daily without ever re-running the sync.
+  const thisTabInfo = allSourceTabs.find(
+    (t) => t.properties?.sheetId === sheetId
+  );
+  const existingRules = thisTabInfo?.conditionalFormats ?? [];
+  // Delete from highest index down so each delete leaves the remaining
+  // indices stable.
+  for (let i = existingRules.length - 1; i >= 0; i--) {
+    requests.push({
+      deleteConditionalFormatRule: { sheetId, index: i },
+    });
+  }
+
+  // Cover every row in the sheet's actual grid so newly added rows
+  // automatically pick up the rules. Falls back to a generous range if
+  // gridProperties is unavailable.
+  const sheetRowCount =
+    thisTabInfo?.properties?.gridProperties?.rowCount ??
+    Math.max(outcomes.length + 1, 1000);
+
+  const renewalColLetter = columnIndexToLetter(targetCol.renewalDate);
+  // The conditional-format range starts at row index 1 (zero-based) = the
+  // first data row, displayed as row 2 in the Sheets UI. Sheets evaluates
+  // the formula with the column anchored ($-prefixed) and the row relative
+  // to each cell in the range, so $X2 auto-shifts to $X3, $X4, … per row.
+  const ref = `$${renewalColLetter}2`;
+
+  const conditionalRange: sheets_v4.Schema$GridRange = {
+    sheetId,
+    startRowIndex: 1,
+    endRowIndex: sheetRowCount,
+    startColumnIndex: 0,
+    endColumnIndex: rowEndCol,
+  };
+
+  const tierRules: Array<{
+    formula: string;
+    bg: { red: number; green: number; blue: number };
+    fg: { red: number; green: number; blue: number };
+  }> = [
+    {
+      // Past (must come first — covers everything strictly before today)
+      formula: `=AND(ISNUMBER(${ref}), ${ref}<TODAY())`,
+      bg: DARK_RED_BG,
+      fg: WHITE_TEXT,
+    },
+    {
+      // Imminent: today + next 4 days
+      formula: `=AND(ISNUMBER(${ref}), ${ref}>=TODAY(), ${ref}<=TODAY()+4)`,
+      bg: LIGHT_RED_BG,
+      fg: BLACK_TEXT,
+    },
+    {
+      // Soon: 5-14 days
+      formula: `=AND(ISNUMBER(${ref}), ${ref}>=TODAY()+5, ${ref}<=TODAY()+14)`,
+      bg: LIGHT_YELLOW_BG,
+      fg: BLACK_TEXT,
+    },
+    {
+      // Later: 15-30 days
+      formula: `=AND(ISNUMBER(${ref}), ${ref}>=TODAY()+15, ${ref}<=TODAY()+30)`,
+      bg: LIGHT_GREEN_BG,
+      fg: BLACK_TEXT,
+    },
+  ];
+
+  tierRules.forEach((r, idx) => {
+    requests.push({
+      addConditionalFormatRule: {
+        rule: {
+          ranges: [conditionalRange],
+          booleanRule: {
+            condition: {
+              type: "CUSTOM_FORMULA",
+              values: [{ userEnteredValue: r.formula }],
+            },
+            format: {
+              backgroundColor: r.bg,
+              textFormat: { foregroundColor: r.fg },
             },
           },
-          fields:
-            "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.foregroundColor",
         },
-      });
-    }
-  }
+        index: idx,
+      },
+    });
+  });
 
   // Row-paint adds N requests for an N-row tab; bumping chunk size keeps
   // total round-trips reasonable on large sheets without risking rate limits.
