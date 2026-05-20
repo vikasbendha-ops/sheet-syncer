@@ -77,7 +77,9 @@ src/app/api/<feature>/config/route.ts       # GET/PUT config
 src/app/<feature>/page.tsx                  # client UI
 ```
 
-Existing features: main sync (`sync-engine`), `email-finder`, `biz-tutor-sync`, `renewal-sync`, `report-sync`, `domain-analyzer`, `consolidator`. The main sync is the only one that uses `_config` — the others use their own `_<feature>_config` tab and don't share state.
+Existing features: main sync (`sync-engine`), `email-finder`, `biz-tutor-sync`, `renewal-sync`, `report-sync`, `domain-analyzer`, `consolidator`, `duplicate-finder`. The main sync is the only one that uses `_config` — the others use their own `_<feature>_config` tab and don't share state.
+
+`duplicate-finder` is read+format-only (no row writes). Treats all picked tabs of one source spreadsheet as a single dataset, finds duplicates in the `Email` and `Telefono Cellulare` columns, then paints cell backgrounds: first occurrence light green, subsequent occurrences light red. Singletons untouched. Phone matching strips non-digits before comparing (raw value preserved). Re-running clears formatting in just the Email + Phone columns of the picked tabs before repainting. No `_config` tab — scans are one-off, not persisted.
 
 `consolidator` is multi-section + multi-source. Each **section** has one or more source spreadsheets (each with its own picked tabs), a user-chosen **output spreadsheet URL**, and a user-typed **output tab name**. Engine dedupes rows by lowercased Email across all sources within a section (phone-wins merge), then writes header `[Name, Surname, Email, Phone]` to the section's output tab (clear + rewrite each run). Multiple sections are configured in one form and run sequentially by `runConsolidatorBatch` — per-section failures are returned in `result.sections[i].error` rather than aborting the batch. Config schema in `_consolidator_config` is `[sectionId, name, outputUrl, outputTabName, sources]` with `sources` as a JSON array; the original single-section legacy schema (`[sourceUrl, sourceTabs]`) is detected by header sniff and migrated to one section on read.
 
