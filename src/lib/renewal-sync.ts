@@ -37,7 +37,17 @@ const HEADER_ALIASES: Record<FieldKey, string[]> = {
     "subscription",
   ],
   startDate: ["start date", "start", "data inizio", "inizio", "data di inizio"],
-  renewalDate: ["renewal date", "renewal", "data rinnovo", "rinnovo", "data di rinnovo"],
+  renewalDate: [
+    "renewal date",
+    "renewal",
+    "data rinnovo",
+    "rinnovo",
+    "data di rinnovo",
+    "renewal / expiry date", // literal header users have in lookup sheets
+    "renewal/expiry date", // no-space variant
+    "expiry date",
+    "expiry",
+  ],
   setterAssigned: ["setter assigned", "setter", "assigned setter", "assegnato"],
 };
 
