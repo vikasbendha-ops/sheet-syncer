@@ -9,7 +9,7 @@ import { sheets_v4 } from "googleapis";
  * Reads selected tabs from a single source spreadsheet, extracts
  * (Nome, Cognome, Email, Telefono Cellulare) columns from each row,
  * dedupes across all rows by Email (case-insensitive), and writes a single
- * "Consolidated" tab into the master sheet.
+ * "Consolidated" tab back into the **same source spreadsheet**.
  *
  * Dedupe rule:
  *  - Key: lowercased Email. Rows without email pass through unmerged
@@ -40,7 +40,7 @@ export interface ConsolidatorTabResult {
 }
 
 export interface ConsolidatorResult {
-  spreadsheetUrl: string; // link to the master sheet's Consolidated tab
+  spreadsheetUrl: string; // link to the source spreadsheet's Consolidated tab
   totalSourceRows: number;
   uniqueRows: number;
   duplicatesMerged: number;
@@ -76,10 +76,10 @@ function clean(value: unknown): string {
 
 async function ensureOutputTab(
   sheets: sheets_v4.Sheets,
-  masterSheetId: string
+  spreadsheetId: string
 ): Promise<number> {
   const meta = await withRetry(() =>
-    sheets.spreadsheets.get({ spreadsheetId: masterSheetId })
+    sheets.spreadsheets.get({ spreadsheetId })
   );
   const existing = (meta.data.sheets ?? []).find(
     (t) => t.properties?.title === OUTPUT_TAB
@@ -90,7 +90,7 @@ async function ensureOutputTab(
 
   const res = await withRetry(() =>
     sheets.spreadsheets.batchUpdate({
-      spreadsheetId: masterSheetId,
+      spreadsheetId,
       requestBody: {
         requests: [{ addSheet: { properties: { title: OUTPUT_TAB } } }],
       },
@@ -98,14 +98,13 @@ async function ensureOutputTab(
   );
   const newSheetId = res.data.replies?.[0]?.addSheet?.properties?.sheetId;
   if (newSheetId === undefined || newSheetId === null) {
-    throw new Error("Failed to create Consolidated tab in master sheet");
+    throw new Error("Failed to create Consolidated tab");
   }
   return newSheetId;
 }
 
 export async function runConsolidator(
   refreshToken: string,
-  masterSheetId: string,
   sourceSpreadsheetId: string,
   sourceTabs: string[]
 ): Promise<ConsolidatorResult> {
@@ -251,13 +250,13 @@ export async function runConsolidator(
   );
   const allRows = [...dedupedRows, ...noEmail];
 
-  // Write to master sheet's Consolidated tab
-  const outputSheetId = await ensureOutputTab(sheets, masterSheetId);
+  // Write the Consolidated tab back into the same source spreadsheet
+  const outputSheetId = await ensureOutputTab(sheets, sourceSpreadsheetId);
 
   // Clear existing content first (full overwrite each run)
   await withRetry(() =>
     sheets.spreadsheets.values.clear({
-      spreadsheetId: masterSheetId,
+      spreadsheetId: sourceSpreadsheetId,
       range: `${OUTPUT_TAB}!A:D`,
     })
   );
@@ -268,7 +267,7 @@ export async function runConsolidator(
 
   await withRetry(() =>
     sheets.spreadsheets.values.update({
-      spreadsheetId: masterSheetId,
+      spreadsheetId: sourceSpreadsheetId,
       range: `${OUTPUT_TAB}!A1:${columnIndexToLetter(headerRow.length - 1)}${valueRows.length}`,
       valueInputOption: "RAW",
       requestBody: { values: valueRows },
@@ -279,7 +278,7 @@ export async function runConsolidator(
   try {
     await withRetry(() =>
       sheets.spreadsheets.batchUpdate({
-        spreadsheetId: masterSheetId,
+        spreadsheetId: sourceSpreadsheetId,
         requestBody: {
           requests: [
             {
@@ -318,7 +317,7 @@ export async function runConsolidator(
   }
 
   return {
-    spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${masterSheetId}/edit#gid=${outputSheetId}`,
+    spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${sourceSpreadsheetId}/edit#gid=${outputSheetId}`,
     totalSourceRows,
     uniqueRows: allRows.length,
     duplicatesMerged,

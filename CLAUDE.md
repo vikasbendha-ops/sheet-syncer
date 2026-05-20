@@ -79,7 +79,7 @@ src/app/<feature>/page.tsx                  # client UI
 
 Existing features: main sync (`sync-engine`), `email-finder`, `biz-tutor-sync`, `renewal-sync`, `report-sync`, `domain-analyzer`, `consolidator`. The main sync is the only one that uses `_config` — the others use their own `_<feature>_config` tab and don't share state.
 
-The `consolidator` is the one outlier on output destination: it reads from a user-picked source spreadsheet but writes the merged `Consolidated` tab into the **master sheet** (not the source). The other features all write back into the same spreadsheet they read from.
+`consolidator` reads selected tabs from a source spreadsheet, dedupes by email (phone-wins merge rule), and writes the merged result to a `Consolidated` tab back in the **same source spreadsheet**. Its persisted config (`_consolidator_config`) still lives in the master sheet like every other feature's config.
 
 ### Notes when editing
 

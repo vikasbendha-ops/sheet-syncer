@@ -206,7 +206,7 @@ export default function ConsolidatorPage() {
           ))}{" "}
           from each tab, dedupes by email (rows with a phone number win), and
           writes a single <code className="bg-card px-1 rounded">Consolidated</code>{" "}
-          tab into your master sheet. Re-running overwrites it.
+          tab back into the same source spreadsheet. Re-running overwrites it.
         </p>
       </div>
 
@@ -336,7 +336,7 @@ export default function ConsolidatorPage() {
               rel="noopener noreferrer"
               className="text-sm text-primary hover:underline font-medium"
             >
-              Open the Consolidated tab →
+              Open the Consolidated tab in the source sheet →
             </a>
           </div>
 

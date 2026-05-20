@@ -25,15 +25,6 @@ export async function POST(request: Request) {
         { status: 401 }
       );
     }
-    if (!session.masterSheetId) {
-      return NextResponse.json(
-        {
-          error:
-            "No master sheet configured. Set one on the Sheets page first.",
-        },
-        { status: 400 }
-      );
-    }
 
     const body = await request.json();
     const parsed = Schema.parse(body);
@@ -42,7 +33,6 @@ export async function POST(request: Request) {
 
     const result = await runConsolidator(
       session.refreshToken,
-      session.masterSheetId,
       sourceId,
       parsed.sourceTabs
     );
