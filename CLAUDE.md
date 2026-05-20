@@ -79,7 +79,7 @@ src/app/<feature>/page.tsx                  # client UI
 
 Existing features: main sync (`sync-engine`), `email-finder`, `biz-tutor-sync`, `renewal-sync`, `report-sync`, `domain-analyzer`, `consolidator`. The main sync is the only one that uses `_config` — the others use their own `_<feature>_config` tab and don't share state.
 
-`consolidator` reads selected tabs from a source spreadsheet, dedupes by email (phone-wins merge rule), and writes the merged result to a `Consolidated` tab back in the **same source spreadsheet**. Its persisted config (`_consolidator_config`) still lives in the master sheet like every other feature's config.
+`consolidator` is multi-section + multi-source. Each **section** has one or more source spreadsheets (each with its own picked tabs), a user-chosen **output spreadsheet URL**, and a user-typed **output tab name**. Engine dedupes rows by lowercased Email across all sources within a section (phone-wins merge), then writes header `[Name, Surname, Email, Phone]` to the section's output tab (clear + rewrite each run). Multiple sections are configured in one form and run sequentially by `runConsolidatorBatch` — per-section failures are returned in `result.sections[i].error` rather than aborting the batch. Config schema in `_consolidator_config` is `[sectionId, name, outputUrl, outputTabName, sources]` with `sources` as a JSON array; the original single-section legacy schema (`[sourceUrl, sourceTabs]`) is detected by header sniff and migrated to one section on read.
 
 ### Notes when editing
 

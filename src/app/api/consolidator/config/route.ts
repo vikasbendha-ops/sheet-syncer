@@ -7,9 +7,21 @@ import {
   clearConsolidatorConfig,
 } from "@/lib/consolidator-config-store";
 
+const SourceSchema = z.object({
+  url: z.string(),
+  tabs: z.array(z.string()),
+});
+
+const SectionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  sources: z.array(SourceSchema),
+  outputUrl: z.string(),
+  outputTabName: z.string(),
+});
+
 const Schema = z.object({
-  sourceUrl: z.string(),
-  sourceTabs: z.array(z.string()),
+  sections: z.array(SectionSchema),
 });
 
 async function requireSession() {

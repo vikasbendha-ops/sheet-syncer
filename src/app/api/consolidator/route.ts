@@ -1,19 +1,33 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getSession } from "@/lib/session";
-import { extractSpreadsheetId } from "@/lib/url-parser";
-import { runConsolidator } from "@/lib/consolidator";
+import { runConsolidatorBatch } from "@/lib/consolidator";
 
-const Schema = z.object({
-  sourceUrl: z
+const SourceSchema = z.object({
+  url: z
     .string()
     .url()
     .refine((url) => url.includes("docs.google.com/spreadsheets"), {
       message: "Source URL must be a Google Sheets URL",
     }),
-  sourceTabs: z
-    .array(z.string().min(1))
-    .min(1, "Select at least one source tab"),
+  tabs: z.array(z.string().min(1)).min(1, "Select at least one tab"),
+});
+
+const SectionSchema = z.object({
+  id: z.string().min(1),
+  name: z.string(),
+  sources: z.array(SourceSchema).min(1, "Section needs at least one source spreadsheet"),
+  outputUrl: z
+    .string()
+    .url()
+    .refine((url) => url.includes("docs.google.com/spreadsheets"), {
+      message: "Output URL must be a Google Sheets URL",
+    }),
+  outputTabName: z.string().min(1, "Output tab name is required"),
+});
+
+const Schema = z.object({
+  sections: z.array(SectionSchema).min(1, "Configure at least one section"),
 });
 
 export async function POST(request: Request) {
@@ -29,15 +43,12 @@ export async function POST(request: Request) {
     const body = await request.json();
     const parsed = Schema.parse(body);
 
-    const sourceId = extractSpreadsheetId(parsed.sourceUrl);
-
-    const result = await runConsolidator(
+    const results = await runConsolidatorBatch(
       session.refreshToken,
-      sourceId,
-      parsed.sourceTabs
+      parsed.sections
     );
 
-    return NextResponse.json(result);
+    return NextResponse.json({ sections: results });
   } catch (err) {
     if (err instanceof z.ZodError) {
       return NextResponse.json(

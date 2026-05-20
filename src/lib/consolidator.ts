@@ -1,26 +1,29 @@
 import { getSheetsClient } from "./google-auth";
 import { withRetry } from "./retry";
 import { normalizeEmail, columnIndexToLetter } from "./email-utils";
+import { extractSpreadsheetId } from "./url-parser";
 import { sheets_v4 } from "googleapis";
 
 /**
  * Consolidator
  *
- * Reads selected tabs from a single source spreadsheet, extracts
- * (Nome, Cognome, Email, Telefono Cellulare) columns from each row,
- * dedupes across all rows by Email (case-insensitive), and writes a single
- * "Consolidated" tab back into the **same source spreadsheet**.
+ * A "section" merges rows from one or more source spreadsheets (each with
+ * one or more picked tabs) and writes a single output tab into a user-chosen
+ * output spreadsheet.
  *
- * Dedupe rule:
- *  - Key: lowercased Email. Rows without email pass through unmerged
- *    (we cannot match them safely).
- *  - When two rows share an email, phone wins: if one row has a phone and
- *    the other doesn't, keep the one with a phone. Otherwise keep the
- *    existing row and only fill blanks from the newcomer.
- *  - For Name / Surname: prefer non-blank, first-seen as tiebreak.
+ * Multiple sections can be configured on the page and run sequentially.
+ *
+ * For each section:
+ *  - Extract (Nome, Cognome, Email, Telefono Cellulare) from every picked
+ *    tab across every picked source spreadsheet.
+ *  - Dedupe across ALL of those rows by lowercased Email.
+ *      * Rows with no valid email pass through unmerged.
+ *      * When two rows share an email, "phone wins": if existing has no
+ *        phone and newcomer does, replace phone. Otherwise keep existing.
+ *        Blank Name / Surname fields are filled from the newcomer.
+ *  - Write header [Name, Surname, Email, Phone] + deduped rows into the
+ *    output spreadsheet's chosen tab (overwrite each run).
  */
-
-const OUTPUT_TAB = "Consolidated";
 
 // Hardcoded Italian source column names (case-insensitive header match)
 const SRC_NAME = "Nome";
@@ -29,6 +32,19 @@ const SRC_EMAIL = "Email";
 const SRC_PHONE = "Telefono Cellulare";
 
 const HEADER_BG = { red: 0.93, green: 0.93, blue: 0.96 };
+
+export interface ConsolidatorSourceConfig {
+  url: string;
+  tabs: string[];
+}
+
+export interface ConsolidatorSection {
+  id: string;
+  name: string;
+  sources: ConsolidatorSourceConfig[];
+  outputUrl: string;
+  outputTabName: string;
+}
 
 export interface ConsolidatorTabResult {
   tabName: string;
@@ -39,21 +55,30 @@ export interface ConsolidatorTabResult {
   error?: string;
 }
 
-export interface ConsolidatorResult {
-  spreadsheetUrl: string; // link to the source spreadsheet's Consolidated tab
+export interface ConsolidatorSourceResult {
+  spreadsheetUrl: string;
+  tabs: ConsolidatorTabResult[];
+  error?: string;
+}
+
+export interface ConsolidatorSectionResult {
+  sectionId: string;
+  sectionName: string;
+  outputSpreadsheetUrl: string;
+  outputTabName: string;
   totalSourceRows: number;
   uniqueRows: number;
   duplicatesMerged: number;
   rowsWithoutEmail: number;
-  tabs: ConsolidatorTabResult[];
+  sources: ConsolidatorSourceResult[];
+  error?: string; // fatal: whole section bailed
 }
 
 interface ConsolidatedRow {
   name: string;
   surname: string;
-  email: string; // normalized lowercase (or "" for unmatched rows)
+  email: string; // normalized lowercase, or raw string when invalid
   phone: string;
-  // bookkeeping
   firstSeenIdx: number;
 }
 
@@ -76,15 +101,19 @@ function clean(value: unknown): string {
 
 async function ensureOutputTab(
   sheets: sheets_v4.Sheets,
-  spreadsheetId: string
+  spreadsheetId: string,
+  tabName: string
 ): Promise<number> {
   const meta = await withRetry(() =>
     sheets.spreadsheets.get({ spreadsheetId })
   );
   const existing = (meta.data.sheets ?? []).find(
-    (t) => t.properties?.title === OUTPUT_TAB
+    (t) => t.properties?.title === tabName
   );
-  if (existing?.properties?.sheetId !== undefined && existing.properties.sheetId !== null) {
+  if (
+    existing?.properties?.sheetId !== undefined &&
+    existing.properties.sheetId !== null
+  ) {
     return existing.properties.sheetId;
   }
 
@@ -92,51 +121,47 @@ async function ensureOutputTab(
     sheets.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
-        requests: [{ addSheet: { properties: { title: OUTPUT_TAB } } }],
+        requests: [{ addSheet: { properties: { title: tabName } } }],
       },
     })
   );
   const newSheetId = res.data.replies?.[0]?.addSheet?.properties?.sheetId;
   if (newSheetId === undefined || newSheetId === null) {
-    throw new Error("Failed to create Consolidated tab");
+    throw new Error(`Failed to create "${tabName}" tab`);
   }
   return newSheetId;
 }
 
-export async function runConsolidator(
-  refreshToken: string,
-  sourceSpreadsheetId: string,
-  sourceTabs: string[]
-): Promise<ConsolidatorResult> {
-  const sheets = getSheetsClient(refreshToken);
-
-  // Read all selected tabs from source spreadsheet
-  const tabResults: ConsolidatorTabResult[] = [];
-
-  // Batched read: one batchGet for all tabs' full ranges (header + data)
-  const ranges = sourceTabs.map((tab) => {
-    const safeTab = `'${tab.replace(/'/g, "''")}'`;
-    return `${safeTab}!A:ZZ`;
+/**
+ * Reads picked tabs from one source spreadsheet and accumulates into the
+ * shared byEmail / noEmail collections. Returns per-tab read results plus a
+ * counter delta for the caller to fold into totals.
+ */
+async function readSourceSpreadsheet(
+  sheets: sheets_v4.Sheets,
+  spreadsheetId: string,
+  tabs: string[],
+  byEmail: Map<string, ConsolidatedRow>,
+  noEmail: ConsolidatedRow[],
+  counters: { nextIdx: number; totalSourceRows: number; duplicatesMerged: number }
+): Promise<ConsolidatorTabResult[]> {
+  const ranges = tabs.map((tab) => {
+    const safe = `'${tab.replace(/'/g, "''")}'`;
+    return `${safe}!A:ZZ`;
   });
 
   const batchRes = await withRetry(() =>
     sheets.spreadsheets.values.batchGet({
-      spreadsheetId: sourceSpreadsheetId,
+      spreadsheetId,
       ranges,
     })
   );
 
   const valueRanges = batchRes.data.valueRanges ?? [];
+  const results: ConsolidatorTabResult[] = [];
 
-  // Build a global, ordered list of rows; key by email when present.
-  const byEmail = new Map<string, ConsolidatedRow>();
-  const noEmail: ConsolidatedRow[] = [];
-  let nextIdx = 0;
-  let totalSourceRows = 0;
-  let duplicatesMerged = 0;
-
-  for (let t = 0; t < sourceTabs.length; t++) {
-    const tabName = sourceTabs[t];
+  for (let t = 0; t < tabs.length; t++) {
+    const tabName = tabs[t];
     const valueRange = valueRanges[t];
     const tabResult: ConsolidatorTabResult = {
       tabName,
@@ -149,7 +174,7 @@ export async function runConsolidator(
     try {
       const rows = (valueRange?.values ?? []) as string[][];
       if (rows.length === 0) {
-        tabResults.push(tabResult);
+        results.push(tabResult);
         continue;
       }
 
@@ -167,8 +192,6 @@ export async function runConsolidator(
       if (idxPhone === -1) missing.push(SRC_PHONE);
       tabResult.missingColumns = missing;
 
-      // If literally none of the four columns are present, skip whole tab.
-      // Otherwise pull whatever we can, leaving missing fields blank.
       if (
         idxName === -1 &&
         idxSurname === -1 &&
@@ -178,7 +201,7 @@ export async function runConsolidator(
         tabResult.error = `None of the expected columns found. Headers: ${headers
           .filter(Boolean)
           .join(", ")}`;
-        tabResults.push(tabResult);
+        results.push(tabResult);
         continue;
       }
 
@@ -189,11 +212,10 @@ export async function runConsolidator(
         const rawEmail = idxEmail >= 0 ? clean(row[idxEmail]) : "";
         const phone = idxPhone >= 0 ? clean(row[idxPhone]) : "";
 
-        // Skip wholly empty rows
         if (!name && !surname && !rawEmail && !phone) continue;
 
         tabResult.totalRows++;
-        totalSourceRows++;
+        counters.totalSourceRows++;
 
         const normalizedEmail = rawEmail ? normalizeEmail(rawEmail) : null;
 
@@ -202,9 +224,9 @@ export async function runConsolidator(
           noEmail.push({
             name,
             surname,
-            email: rawEmail, // keep raw (may be invalid format) so user sees it
+            email: rawEmail,
             phone,
-            firstSeenIdx: nextIdx++,
+            firstSeenIdx: counters.nextIdx++,
           });
           continue;
         }
@@ -218,110 +240,211 @@ export async function runConsolidator(
             surname,
             email: normalizedEmail,
             phone,
-            firstSeenIdx: nextIdx++,
+            firstSeenIdx: counters.nextIdx++,
           });
           continue;
         }
 
-        // Merge: phone wins. Within name/surname: prefer non-blank, keep existing as tiebreak.
-        duplicatesMerged++;
-
-        // Phone: if existing lacks phone and new has phone, take new's phone.
-        // If both have phones, keep existing (first-seen).
-        if (!existing.phone && phone) {
-          existing.phone = phone;
-        }
-        // Name / surname: fill blanks from newcomer
+        counters.duplicatesMerged++;
+        if (!existing.phone && phone) existing.phone = phone;
         if (!existing.name && name) existing.name = name;
         if (!existing.surname && surname) existing.surname = surname;
       }
 
-      tabResults.push(tabResult);
+      results.push(tabResult);
     } catch (err) {
       tabResult.error =
         err instanceof Error ? err.message : "Failed to read tab";
-      tabResults.push(tabResult);
+      results.push(tabResult);
     }
   }
 
-  // Final row order: deduped-by-email first (in first-seen order), then no-email rows
+  return results;
+}
+
+export async function runConsolidatorSection(
+  refreshToken: string,
+  section: ConsolidatorSection
+): Promise<ConsolidatorSectionResult> {
+  const sectionResult: ConsolidatorSectionResult = {
+    sectionId: section.id,
+    sectionName: section.name,
+    outputSpreadsheetUrl: "",
+    outputTabName: section.outputTabName || "Consolidated",
+    totalSourceRows: 0,
+    uniqueRows: 0,
+    duplicatesMerged: 0,
+    rowsWithoutEmail: 0,
+    sources: [],
+  };
+
+  const sheets = getSheetsClient(refreshToken);
+
+  // Resolve output spreadsheet first (fail fast if URL is bogus)
+  let outputSpreadsheetId: string;
+  try {
+    outputSpreadsheetId = extractSpreadsheetId(section.outputUrl);
+  } catch (err) {
+    sectionResult.error =
+      err instanceof Error ? err.message : "Invalid output spreadsheet URL";
+    return sectionResult;
+  }
+
+  if (section.sources.length === 0) {
+    sectionResult.error = "Section has no source spreadsheets configured.";
+    return sectionResult;
+  }
+
+  const byEmail = new Map<string, ConsolidatedRow>();
+  const noEmail: ConsolidatedRow[] = [];
+  const counters = { nextIdx: 0, totalSourceRows: 0, duplicatesMerged: 0 };
+
+  for (const src of section.sources) {
+    const sourceResult: ConsolidatorSourceResult = {
+      spreadsheetUrl: src.url,
+      tabs: [],
+    };
+
+    try {
+      const spreadsheetId = extractSpreadsheetId(src.url);
+      if (!src.tabs.length) {
+        sourceResult.error = "No tabs selected for this source.";
+      } else {
+        sourceResult.tabs = await readSourceSpreadsheet(
+          sheets,
+          spreadsheetId,
+          src.tabs,
+          byEmail,
+          noEmail,
+          counters
+        );
+      }
+    } catch (err) {
+      sourceResult.error =
+        err instanceof Error ? err.message : "Failed to read source";
+    }
+
+    sectionResult.sources.push(sourceResult);
+  }
+
+  sectionResult.totalSourceRows = counters.totalSourceRows;
+  sectionResult.duplicatesMerged = counters.duplicatesMerged;
+  sectionResult.rowsWithoutEmail = noEmail.length;
+
   const dedupedRows = Array.from(byEmail.values()).sort(
     (a, b) => a.firstSeenIdx - b.firstSeenIdx
   );
   const allRows = [...dedupedRows, ...noEmail];
+  sectionResult.uniqueRows = allRows.length;
 
-  // Write the Consolidated tab back into the same source spreadsheet
-  const outputSheetId = await ensureOutputTab(sheets, sourceSpreadsheetId);
-
-  // Clear existing content first (full overwrite each run)
-  await withRetry(() =>
-    sheets.spreadsheets.values.clear({
-      spreadsheetId: sourceSpreadsheetId,
-      range: `${OUTPUT_TAB}!A:D`,
-    })
-  );
-
-  const headerRow = ["Name", "Surname", "Email", "Phone"];
-  const dataRows = allRows.map((r) => [r.name, r.surname, r.email, r.phone]);
-  const valueRows = [headerRow, ...dataRows];
-
-  await withRetry(() =>
-    sheets.spreadsheets.values.update({
-      spreadsheetId: sourceSpreadsheetId,
-      range: `${OUTPUT_TAB}!A1:${columnIndexToLetter(headerRow.length - 1)}${valueRows.length}`,
-      valueInputOption: "RAW",
-      requestBody: { values: valueRows },
-    })
-  );
-
-  // Style header row (bold + light bg) — best effort, do not fail the run if styling fails
+  // Write output
   try {
+    const tabName = sectionResult.outputTabName;
+    const outputSheetId = await ensureOutputTab(
+      sheets,
+      outputSpreadsheetId,
+      tabName
+    );
+
+    const safeTab = `'${tabName.replace(/'/g, "''")}'`;
     await withRetry(() =>
-      sheets.spreadsheets.batchUpdate({
-        spreadsheetId: sourceSpreadsheetId,
-        requestBody: {
-          requests: [
-            {
-              repeatCell: {
-                range: {
-                  sheetId: outputSheetId,
-                  startRowIndex: 0,
-                  endRowIndex: 1,
-                  startColumnIndex: 0,
-                  endColumnIndex: headerRow.length,
-                },
-                cell: {
-                  userEnteredFormat: {
-                    backgroundColor: HEADER_BG,
-                    textFormat: { bold: true },
-                  },
-                },
-                fields: "userEnteredFormat(backgroundColor,textFormat)",
-              },
-            },
-            {
-              updateSheetProperties: {
-                properties: {
-                  sheetId: outputSheetId,
-                  gridProperties: { frozenRowCount: 1 },
-                },
-                fields: "gridProperties.frozenRowCount",
-              },
-            },
-          ],
-        },
+      sheets.spreadsheets.values.clear({
+        spreadsheetId: outputSpreadsheetId,
+        range: `${safeTab}!A:D`,
       })
     );
-  } catch {
-    // ignore styling failure
+
+    const headerRow = ["Name", "Surname", "Email", "Phone"];
+    const dataRows = allRows.map((r) => [r.name, r.surname, r.email, r.phone]);
+    const valueRows = [headerRow, ...dataRows];
+
+    await withRetry(() =>
+      sheets.spreadsheets.values.update({
+        spreadsheetId: outputSpreadsheetId,
+        range: `${safeTab}!A1:${columnIndexToLetter(headerRow.length - 1)}${valueRows.length}`,
+        valueInputOption: "RAW",
+        requestBody: { values: valueRows },
+      })
+    );
+
+    // Best-effort header styling
+    try {
+      await withRetry(() =>
+        sheets.spreadsheets.batchUpdate({
+          spreadsheetId: outputSpreadsheetId,
+          requestBody: {
+            requests: [
+              {
+                repeatCell: {
+                  range: {
+                    sheetId: outputSheetId,
+                    startRowIndex: 0,
+                    endRowIndex: 1,
+                    startColumnIndex: 0,
+                    endColumnIndex: headerRow.length,
+                  },
+                  cell: {
+                    userEnteredFormat: {
+                      backgroundColor: HEADER_BG,
+                      textFormat: { bold: true },
+                    },
+                  },
+                  fields: "userEnteredFormat(backgroundColor,textFormat)",
+                },
+              },
+              {
+                updateSheetProperties: {
+                  properties: {
+                    sheetId: outputSheetId,
+                    gridProperties: { frozenRowCount: 1 },
+                  },
+                  fields: "gridProperties.frozenRowCount",
+                },
+              },
+            ],
+          },
+        })
+      );
+    } catch {
+      // ignore styling failure
+    }
+
+    sectionResult.outputSpreadsheetUrl = `https://docs.google.com/spreadsheets/d/${outputSpreadsheetId}/edit#gid=${outputSheetId}`;
+  } catch (err) {
+    sectionResult.error =
+      err instanceof Error ? err.message : "Failed to write output";
   }
 
-  return {
-    spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${sourceSpreadsheetId}/edit#gid=${outputSheetId}`,
-    totalSourceRows,
-    uniqueRows: allRows.length,
-    duplicatesMerged,
-    rowsWithoutEmail: noEmail.length,
-    tabs: tabResults,
-  };
+  return sectionResult;
+}
+
+/**
+ * Runs every section sequentially. A section's failure does not abort the
+ * rest — its error is returned in that section's result instead.
+ */
+export async function runConsolidatorBatch(
+  refreshToken: string,
+  sections: ConsolidatorSection[]
+): Promise<ConsolidatorSectionResult[]> {
+  const results: ConsolidatorSectionResult[] = [];
+  for (const section of sections) {
+    try {
+      const r = await runConsolidatorSection(refreshToken, section);
+      results.push(r);
+    } catch (err) {
+      results.push({
+        sectionId: section.id,
+        sectionName: section.name,
+        outputSpreadsheetUrl: "",
+        outputTabName: section.outputTabName || "Consolidated",
+        totalSourceRows: 0,
+        uniqueRows: 0,
+        duplicatesMerged: 0,
+        rowsWithoutEmail: 0,
+        sources: [],
+        error: err instanceof Error ? err.message : "Section failed",
+      });
+    }
+  }
+  return results;
 }
