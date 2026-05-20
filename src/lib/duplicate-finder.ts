@@ -27,8 +27,49 @@ import { sheets_v4 } from "googleapis";
  * previous runs do not linger.
  */
 
-const SRC_EMAIL = "Email";
-const SRC_PHONE = "Telefono Cellulare";
+const SRC_EMAIL_LABEL = "Email";
+const SRC_PHONE_LABEL = "Telefono Cellulare";
+
+// Ordered alias list — first match wins. Headers are normalized
+// (lowercase, trimmed, whitespace-collapsed, zero-width stripped) before
+// comparison, so users can write any reasonable variant.
+const EMAIL_ALIASES = [
+  "email",
+  "e-mail",
+  "email address",
+  "emailaddress",
+  "mail",
+  "indirizzo email",
+  "indirizzo e-mail",
+  "indirizzo mail",
+];
+
+const PHONE_ALIASES = [
+  "telefono cellulare",
+  "telefono cellular", // common typo
+  "cellulare",
+  "telefono",
+  "telefono mobile",
+  "numero di telefono",
+  "numero telefono",
+  "numero",
+  "phone number",
+  "mobile number",
+  "phone",
+  "mobile",
+  "cell",
+  "cellphone",
+  "tel",
+  "telephone",
+];
+
+// Last-resort substring matches when no alias hits exactly.
+const PHONE_SUBSTRING_FALLBACKS = [
+  "telefono",
+  "cellulare",
+  "phone",
+  "mobile",
+];
 
 const GREEN_BG = { red: 0.78, green: 0.92, blue: 0.78 };
 const RED_BG = { red: 1.0, green: 0.82, blue: 0.82 };
@@ -40,6 +81,8 @@ export interface DuplicateFinderTabResult {
   emailDuplicateCells: number; // count of duplicate (non-first) email cells in this tab
   phoneDuplicateCells: number; // same for phone
   missingColumns: string[];
+  detectedEmailHeader: string | null; // the actual header text matched, or null if not found
+  detectedPhoneHeader: string | null;
   error?: string;
 }
 
@@ -58,25 +101,73 @@ interface CellLocation {
   colIndex: number; // 0-based
 }
 
+// Strip ZERO WIDTH SPACE (U+200B), ZERO WIDTH NON-JOINER (U+200C),
+// ZERO WIDTH JOINER (U+200D), BYTE ORDER MARK (U+FEFF). Some sheets pasted
+// from other tools carry these in header cells and break exact matches.
+const ZERO_WIDTH_RE = /[​‌‍﻿]/g;
+
 function normalizeHeader(s: unknown): string {
   return String(s ?? "")
     .toLowerCase()
+    .replace(ZERO_WIDTH_RE, "")
     .trim()
     .replace(/\s+/g, " ");
 }
 
-function findHeaderIndex(headers: string[], target: string): number {
-  const want = normalizeHeader(target);
-  return headers.findIndex((h) => normalizeHeader(h) === want);
+/**
+ * Returns the index of the first header matching any alias (exact normalized
+ * match). If none match and `substringFallbacks` are provided, the first
+ * header whose normalized form contains any fallback is returned.
+ * Returns -1 if nothing matches.
+ */
+function findColumnByAliases(
+  headers: string[],
+  aliases: string[],
+  substringFallbacks: string[] = []
+): number {
+  const normalized = headers.map(normalizeHeader);
+  for (const alias of aliases) {
+    const want = normalizeHeader(alias);
+    const idx = normalized.findIndex((h) => h === want);
+    if (idx !== -1) return idx;
+  }
+  for (const sub of substringFallbacks) {
+    const wantSub = normalizeHeader(sub);
+    const idx = normalized.findIndex((h) => h.includes(wantSub));
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+/**
+ * Convert a raw cell value (string, number, boolean, …) to a string without
+ * scientific notation. Phones stored as numbers — e.g. 393331234567 — render
+ * as "3.93331E+11" under FORMATTED_VALUE, which collides with itself and
+ * misses real string-format duplicates. Using UNFORMATTED_VALUE we get the
+ * number back as a JS number; this helper stringifies safely.
+ */
+function rawCellToString(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "number") {
+    if (!Number.isFinite(v)) return "";
+    // toLocaleString with useGrouping:false avoids exponent form for very
+    // large integers and avoids 1234567,89-style grouping.
+    return v.toLocaleString("en-US", {
+      useGrouping: false,
+      maximumFractionDigits: 20,
+    });
+  }
+  if (typeof v === "boolean") return v ? "TRUE" : "FALSE";
+  return String(v);
 }
 
 function clean(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  return String(value).trim();
+  return rawCellToString(value).trim();
 }
 
-function normalizePhone(raw: string): string | null {
-  const digits = raw.replace(/\D/g, "");
+function normalizePhone(raw: unknown): string | null {
+  const str = rawCellToString(raw);
+  const digits = str.replace(/\D/g, "");
   if (!digits) return null;
   return digits;
 }
@@ -150,13 +241,19 @@ export async function runDuplicateFinder(
     tabInfoByName.set(t, found.properties.sheetId);
   }
 
-  // Batch-read every picked tab in one call
+  // Batch-read every picked tab in one call. UNFORMATTED_VALUE so phones
+  // stored as numbers come through as actual JS numbers (and can be stringified
+  // without scientific notation) instead of rendering as "3.93E+11".
   const ranges = tabs.map((tab) => {
     const safe = `'${tab.replace(/'/g, "''")}'`;
     return `${safe}!A:ZZ`;
   });
   const batchRes = await withRetry(() =>
-    sheets.spreadsheets.values.batchGet({ spreadsheetId, ranges })
+    sheets.spreadsheets.values.batchGet({
+      spreadsheetId,
+      ranges,
+      valueRenderOption: "UNFORMATTED_VALUE",
+    })
   );
   const valueRanges = batchRes.data.valueRanges ?? [];
 
@@ -179,7 +276,7 @@ export async function runDuplicateFinder(
   for (let i = 0; i < tabs.length; i++) {
     const tabName = tabs[i];
     const sheetId = tabInfoByName.get(tabName) as number;
-    const rows = (valueRanges[i]?.values ?? []) as string[][];
+    const rows = (valueRanges[i]?.values ?? []) as unknown[][];
 
     const tabResult: DuplicateFinderTabResult = {
       tabName,
@@ -187,33 +284,42 @@ export async function runDuplicateFinder(
       emailDuplicateCells: 0,
       phoneDuplicateCells: 0,
       missingColumns: [],
+      detectedEmailHeader: null,
+      detectedPhoneHeader: null,
     };
 
     if (rows.length === 0) {
+      tabResult.missingColumns = [SRC_EMAIL_LABEL, SRC_PHONE_LABEL];
       snapshots.push({
         tabName,
         sheetId,
         idxEmail: -1,
         idxPhone: -1,
         totalRows: 0,
-        missing: [SRC_EMAIL, SRC_PHONE],
+        missing: [SRC_EMAIL_LABEL, SRC_PHONE_LABEL],
         result: tabResult,
       });
-      tabResult.missingColumns = [SRC_EMAIL, SRC_PHONE];
       continue;
     }
 
-    const headers = (rows[0] ?? []).map((h) => String(h ?? ""));
-    const idxEmail = findHeaderIndex(headers, SRC_EMAIL);
-    const idxPhone = findHeaderIndex(headers, SRC_PHONE);
+    const headers = (rows[0] ?? []).map((h) => rawCellToString(h));
+    const idxEmail = findColumnByAliases(headers, EMAIL_ALIASES);
+    const idxPhone = findColumnByAliases(
+      headers,
+      PHONE_ALIASES,
+      PHONE_SUBSTRING_FALLBACKS
+    );
+
+    tabResult.detectedEmailHeader = idxEmail >= 0 ? headers[idxEmail] : null;
+    tabResult.detectedPhoneHeader = idxPhone >= 0 ? headers[idxPhone] : null;
 
     const missing: string[] = [];
-    if (idxEmail === -1) missing.push(SRC_EMAIL);
-    if (idxPhone === -1) missing.push(SRC_PHONE);
+    if (idxEmail === -1) missing.push(SRC_EMAIL_LABEL);
+    if (idxPhone === -1) missing.push(SRC_PHONE_LABEL);
     tabResult.missingColumns = missing;
 
     if (idxEmail === -1 && idxPhone === -1) {
-      tabResult.error = `Neither "${SRC_EMAIL}" nor "${SRC_PHONE}" column found. Headers: ${headers
+      tabResult.error = `Neither an email nor a phone column was found. Headers: ${headers
         .filter(Boolean)
         .join(", ")}`;
       snapshots.push({
@@ -251,8 +357,7 @@ export async function runDuplicateFinder(
       }
 
       if (idxPhone >= 0) {
-        const rawPhone = clean(row[idxPhone]);
-        const phoneKey = rawPhone ? normalizePhone(rawPhone) : null;
+        const phoneKey = normalizePhone(row[idxPhone]);
         if (phoneKey) {
           const list = phoneMap.get(phoneKey);
           const loc: CellLocation = {

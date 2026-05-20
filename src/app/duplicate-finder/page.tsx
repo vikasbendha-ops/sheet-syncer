@@ -8,6 +8,8 @@ interface TabResult {
   emailDuplicateCells: number;
   phoneDuplicateCells: number;
   missingColumns: string[];
+  detectedEmailHeader: string | null;
+  detectedPhoneHeader: string | null;
   error?: string;
 }
 
@@ -272,6 +274,26 @@ export default function DuplicateFinderPage() {
                     </span>
                   )}
                 </div>
+                {!t.error && (
+                  <p className="text-[10px] text-muted">
+                    Matched email column:{" "}
+                    {t.detectedEmailHeader ? (
+                      <code className="bg-background px-1 rounded">
+                        {t.detectedEmailHeader}
+                      </code>
+                    ) : (
+                      <span className="text-danger">not found</span>
+                    )}{" "}
+                    · Matched phone column:{" "}
+                    {t.detectedPhoneHeader ? (
+                      <code className="bg-background px-1 rounded">
+                        {t.detectedPhoneHeader}
+                      </code>
+                    ) : (
+                      <span className="text-danger">not found</span>
+                    )}
+                  </p>
+                )}
                 {t.missingColumns.length > 0 && !t.error && (
                   <span className="text-xs text-danger">
                     Missing columns: {t.missingColumns.join(", ")}
