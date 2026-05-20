@@ -23,10 +23,14 @@ interface SectionResult {
   outputSpreadsheetUrl: string;
   outputTabName: string;
   totalSourceRows: number;
-  uniqueRows: number;
-  duplicatesMerged: number;
+  totalOutputRows: number;
   rowsWithoutEmail: number;
   totalColumns: number;
+  emailDuplicateValues: number;
+  emailDuplicateCells: number;
+  phoneDuplicateValues: number;
+  phoneDuplicateCells: number;
+  renewalRulesInstalled: boolean;
   sources: SourceResult[];
   error?: string;
 }
@@ -507,11 +511,12 @@ export default function ConsolidatorPage() {
           one or more source spreadsheets (each with its own picked tabs) and
           writes a single output tab into the spreadsheet you choose. The
           output is the <span className="font-medium">union of every column</span>{" "}
-          seen across all picked tabs — first-seen order, headers matched
-          case-insensitively. Rows are deduped by{" "}
-          <code className="bg-card px-1 rounded">Email</code>; when the same
-          email appears more than once, the first non-blank value per column
-          wins. Each section is independent — use its own{" "}
+          seen across all picked tabs — every source row is kept (no
+          merging or deletion, so nothing is lost). After writing, duplicate
+          Email and Phone values get highlighted (first occurrence light
+          green, the rest light red), and if a Renewal Date column is
+          present the four-tier renewal proximity highlighting is installed
+          on the output tab. Each section is independent — use its own{" "}
           <span className="font-medium">Run section</span> button, or hit{" "}
           <span className="font-medium">Run all</span> at the bottom to do
           them in one go.
@@ -768,25 +773,43 @@ function InlineResult({ result }: { result: SectionResult }) {
         </p>
       ) : (
         <>
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-sm">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
             <Stat label="Source rows" value={result.totalSourceRows} />
-            <Stat label="Unique" value={result.uniqueRows} accent="success" />
             <Stat
-              label="Duplicates merged"
-              value={result.duplicatesMerged}
-              accent="muted"
-            />
-            <Stat
-              label="Rows w/o email"
-              value={result.rowsWithoutEmail}
-              accent={result.rowsWithoutEmail > 0 ? "danger" : "muted"}
+              label="Output rows"
+              value={result.totalOutputRows}
+              accent="success"
             />
             <Stat
               label="Columns"
               value={result.totalColumns}
               accent="muted"
             />
+            <Stat
+              label="Email dupes"
+              value={result.emailDuplicateCells}
+              accent={result.emailDuplicateCells > 0 ? "danger" : "muted"}
+              hint={`${result.emailDuplicateValues} distinct value${result.emailDuplicateValues === 1 ? "" : "s"}`}
+            />
+            <Stat
+              label="Phone dupes"
+              value={result.phoneDuplicateCells}
+              accent={result.phoneDuplicateCells > 0 ? "danger" : "muted"}
+              hint={`${result.phoneDuplicateValues} distinct value${result.phoneDuplicateValues === 1 ? "" : "s"}`}
+            />
+            <Stat
+              label="Rows w/o email"
+              value={result.rowsWithoutEmail}
+              accent={result.rowsWithoutEmail > 0 ? "danger" : "muted"}
+            />
           </div>
+          {result.renewalRulesInstalled && (
+            <p className="text-xs text-success bg-success/10 rounded-md px-3 py-2">
+              Renewal Date column detected — 4-tier conditional formatting
+              installed (past / 0-4d / 5-14d / 15-30d). Sheets re-evaluates
+              it daily.
+            </p>
+          )}
 
           <div className="space-y-3 mt-3">
             {result.sources.map((src, i) => (
@@ -954,10 +977,12 @@ function Stat({
   label,
   value,
   accent,
+  hint,
 }: {
   label: string;
   value: number;
   accent?: "success" | "danger" | "muted";
+  hint?: string;
 }) {
   const valueClass =
     accent === "success"
@@ -971,6 +996,7 @@ function Stat({
     <div className="bg-background border border-border rounded-md px-3 py-2">
       <p className="text-xs text-muted">{label}</p>
       <p className={`text-lg font-semibold ${valueClass}`}>{value}</p>
+      {hint && <p className="text-[10px] text-muted mt-0.5">{hint}</p>}
     </div>
   );
 }

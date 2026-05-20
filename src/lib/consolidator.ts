@@ -1,7 +1,8 @@
 import { getSheetsClient } from "./google-auth";
 import { withRetry } from "./retry";
-import { normalizeEmail, findEmailColumnIndex, columnIndexToLetter } from "./email-utils";
+import { normalizeEmail, columnIndexToLetter } from "./email-utils";
 import { extractSpreadsheetId } from "./url-parser";
+import { parseFlexibleDate, toSheetsDateSerial } from "./sheet-dates";
 import { sheets_v4 } from "googleapis";
 
 /**
@@ -11,29 +12,111 @@ import { sheets_v4 } from "googleapis";
  * one or more picked tabs) into a user-chosen output spreadsheet + tab.
  *
  * Schema: the output is the UNION of every column header seen across all
- * picked tabs of all picked sources. Output column order = first-seen order:
- * source 1 / tab 1's columns come first, then any NEW columns introduced
- * by subsequent tabs/sources appended at the end. Headers are matched
- * case-insensitively with whitespace collapsed (so "Email" and "email "
- * fold into one column), and the first-seen casing is kept for the output
- * header text.
+ * picked tabs of all picked sources. Output column order = first-seen order.
+ * Headers are matched case-insensitively with whitespace collapsed (so
+ * "Email" and "email " fold into one column), and the first-seen casing is
+ * kept for the output header text.
  *
- * Dedupe + merge rule (per section, across all sources combined):
- *  - Dedupe key: lowercased, validated Email. Rows whose Email column is
- *    blank or invalid pass through unmerged at the bottom of the output.
- *  - When two rows share an email, columns are merged with "first non-blank
- *    value wins" semantics: the existing row keeps every non-blank cell it
- *    already has, and only its blank cells get filled in from the newcomer.
- *    This is the generalization of the old "phone wins" rule — any column
- *    where the first source had no value picks up the second source's value.
- *  - For Name / Surname / Phone / any column: same uniform rule.
+ * Row model: **every source row is preserved** — no email-keyed merge. If
+ * the same person appears in multiple sources with different data per
+ * source, you get one output row per source so no data is lost.
+ *
+ * Highlighting passes applied after the bulk write:
+ *
+ *  1. Email duplicates — values seen >1 time in the Email column get the
+ *     first occurrence painted light green and every subsequent occurrence
+ *     painted light red. Same convention as the Duplicate Finder feature.
+ *
+ *  2. Phone duplicates — same rule for the phone column (case-insensitive
+ *     header alias match: Telefono Cellulare, Telefono, Cellulare, Phone,
+ *     Mobile, …). Comparison strips all non-digits so "+39 333 1234567"
+ *     and "393331234567" dedupe to the same key.
+ *
+ *  3. Renewal Date conditional formatting — if a Renewal Date column is
+ *     present (alias-matched: "Renewal Date", "Renewal / Expiry Date",
+ *     "Expiry", "Data rinnovo", …), the cells in that column are converted
+ *     to real Sheets date values (number serial + DATE format) and four
+ *     native conditional-format rules are installed on the section's row
+ *     range, with the same four-tier semantics as the renewal-sync engine:
+ *
+ *       past      → dark red bg + white text
+ *       0–4 days  → light red bg
+ *       5–14 days → light yellow bg
+ *       15–30 days→ light green bg
+ *
+ *     Conditional rules persist in the spreadsheet — Sheets re-evaluates
+ *     them on every open and every cell edit, so highlighting refreshes
+ *     daily without re-running consolidate.
  *
  * Output destination: writes back into the user-chosen output spreadsheet
  * (the section's `outputUrl`), as a tab named `outputTabName`. Each run is
- * a full overwrite of that tab (clear A:ZZ then write headers + rows).
+ * a full overwrite of that tab.
  */
 
 const HEADER_BG = { red: 0.93, green: 0.93, blue: 0.96 };
+
+// Duplicate-finder palette
+const DUP_GREEN_BG = { red: 0.78, green: 0.92, blue: 0.78 };
+const DUP_RED_BG = { red: 1.0, green: 0.82, blue: 0.82 };
+
+// Renewal-tier palette (matches renewal-sync exactly)
+const LIGHT_GREEN_BG = { red: 0.78, green: 0.92, blue: 0.78 }; // 15-30 days
+const LIGHT_YELLOW_BG = { red: 1.0, green: 0.95, blue: 0.7 }; // 5-14 days
+const LIGHT_RED_BG = { red: 1.0, green: 0.82, blue: 0.82 }; // 0-4 days
+const DARK_RED_BG = { red: 0.78, green: 0.1, blue: 0.1 }; // past
+const BLACK_TEXT = { red: 0, green: 0, blue: 0 };
+const WHITE_TEXT = { red: 1, green: 1, blue: 1 };
+
+// Column-detection aliases (all values are pre-normalized lowercase,
+// trimmed, whitespace-collapsed — matched against the registry keys which
+// are also normalized).
+const EMAIL_ALIASES = [
+  "email",
+  "e-mail",
+  "email address",
+  "emailaddress",
+  "mail",
+  "indirizzo email",
+  "indirizzo e-mail",
+  "indirizzo mail",
+];
+
+const PHONE_ALIASES = [
+  "telefono cellulare",
+  "telefono cellular",
+  "cellulare",
+  "telefono",
+  "telefono mobile",
+  "numero di telefono",
+  "numero telefono",
+  "phone number",
+  "mobile number",
+  "phone",
+  "mobile",
+  "cell",
+  "cellphone",
+  "tel",
+  "telephone",
+];
+
+const PHONE_SUBSTRING_FALLBACKS = [
+  "telefono",
+  "cellulare",
+  "phone",
+  "mobile",
+];
+
+const RENEWAL_DATE_ALIASES = [
+  "renewal date",
+  "renewal",
+  "data rinnovo",
+  "rinnovo",
+  "data di rinnovo",
+  "renewal / expiry date",
+  "renewal/expiry date",
+  "expiry date",
+  "expiry",
+];
 
 export interface ConsolidatorSourceConfig {
   url: string;
@@ -50,10 +133,10 @@ export interface ConsolidatorSection {
 
 export interface ConsolidatorTabResult {
   tabName: string;
-  totalRows: number; // non-empty rows read
+  totalRows: number;
   rowsWithEmail: number;
   rowsWithoutEmail: number;
-  columnsContributed: number; // headers this tab introduced into the union
+  columnsContributed: number;
   error?: string;
 }
 
@@ -69,28 +152,25 @@ export interface ConsolidatorSectionResult {
   outputSpreadsheetUrl: string;
   outputTabName: string;
   totalSourceRows: number;
-  uniqueRows: number;
-  duplicatesMerged: number;
+  totalOutputRows: number;
   rowsWithoutEmail: number;
-  totalColumns: number; // size of the consolidated column union
+  totalColumns: number;
+  emailDuplicateValues: number; // distinct email values seen >1 time
+  emailDuplicateCells: number; // cells painted red (occurrences - 1 per value)
+  phoneDuplicateValues: number;
+  phoneDuplicateCells: number;
+  renewalRulesInstalled: boolean;
   sources: ConsolidatorSourceResult[];
-  error?: string; // fatal: whole section bailed
+  error?: string;
 }
 
-/**
- * Tracks the running set of columns we've seen across a section's sources.
- *  - `keys` is the insertion-ordered list of normalized column keys.
- *  - `headers` maps a normalized key to the first-seen ORIGINAL header text
- *    (preserving the user's casing for the output row).
- */
 interface ColumnRegistry {
   keys: string[];
   headers: Map<string, string>;
 }
 
 interface ConsolidatedRow {
-  values: Map<string, string>; // normalized key → cell value
-  firstSeenIdx: number; // stable ordering across the run
+  values: Map<string, string>; // normalized column key → cell value
 }
 
 function normalizeColumnKey(header: string): string {
@@ -101,8 +181,6 @@ function clean(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "number") {
     if (!Number.isFinite(value)) return "";
-    // Avoid scientific notation for large integers (e.g. phone numbers
-    // stored numerically would render as 3.93E+11 under default toString).
     return value.toLocaleString("en-US", {
       useGrouping: false,
       maximumFractionDigits: 20,
@@ -112,11 +190,33 @@ function clean(value: unknown): string {
   return String(value).trim();
 }
 
+function normalizePhoneKey(value: string): string | null {
+  const digits = value.replace(/\D/g, "");
+  return digits || null;
+}
+
+/** Find the registry key matching any of the aliases (exact normalized). */
+function findRegistryKey(
+  registry: ColumnRegistry,
+  aliases: string[],
+  substringFallbacks: string[] = []
+): string | null {
+  for (const alias of aliases) {
+    const want = normalizeColumnKey(alias);
+    const hit = registry.keys.find((k) => k === want);
+    if (hit) return hit;
+  }
+  for (const sub of substringFallbacks) {
+    const wantSub = normalizeColumnKey(sub);
+    const hit = registry.keys.find((k) => k.includes(wantSub));
+    if (hit) return hit;
+  }
+  return null;
+}
+
 /**
  * Ensures the output tab exists with enough columns to hold the union.
- * - New tab: created with `requiredCols` columns straight away.
- * - Existing tab: grows the grid via appendDimension if its current
- *   columnCount is short.
+ * Grows the grid via appendDimension if an existing tab is too narrow.
  */
 async function ensureOutputTab(
   sheets: sheets_v4.Sheets,
@@ -187,31 +287,23 @@ async function ensureOutputTab(
 }
 
 /**
- * Reads picked tabs from one source spreadsheet, registering every column
- * header seen, and folding rows into the section's byEmail / noEmail
- * collections with "first non-blank value wins" merge semantics.
+ * Reads picked tabs from one source spreadsheet, registers headers, and
+ * appends every non-empty row to allRows. No merging.
  */
 async function readSourceSpreadsheet(
   sheets: sheets_v4.Sheets,
   spreadsheetId: string,
   tabs: string[],
   registry: ColumnRegistry,
-  byEmail: Map<string, ConsolidatedRow>,
-  noEmail: ConsolidatedRow[],
-  counters: {
-    nextIdx: number;
-    totalSourceRows: number;
-    duplicatesMerged: number;
-  }
+  allRows: ConsolidatedRow[],
+  emailColumnExisted: { value: boolean },
+  counters: { totalSourceRows: number; rowsWithoutEmail: number }
 ): Promise<ConsolidatorTabResult[]> {
   const ranges = tabs.map((tab) => {
     const safe = `'${tab.replace(/'/g, "''")}'`;
     return `${safe}!A:ZZ`;
   });
 
-  // UNFORMATTED_VALUE so numeric cells (phone numbers, IDs) don't come
-  // back as "3.93E+11"; clean() handles the JS number → safe string
-  // conversion afterward.
   const batchRes = await withRetry(() =>
     sheets.spreadsheets.values.batchGet({
       spreadsheetId,
@@ -243,13 +335,8 @@ async function readSourceSpreadsheet(
       const headerRow = rows[0] ?? [];
       const headerStrings = headerRow.map((h) => clean(h));
 
-      // Build per-column key array for this tab. Empty/whitespace-only
-      // headers are skipped — their cells are unreferenced. Duplicate
-      // headers within the same tab take the FIRST column's index; later
-      // duplicates are treated as the same key (their values fold into the
-      // first column's value via blank-fill).
+      // Map column index → normalized registry key (or "" if blank header).
       const tabColKeys: string[] = new Array(headerStrings.length);
-      const seenInThisTab = new Set<string>();
       const beforeRegistrySize = registry.keys.length;
       for (let c = 0; c < headerStrings.length; c++) {
         const orig = headerStrings[c];
@@ -263,7 +350,6 @@ async function readSourceSpreadsheet(
           continue;
         }
         tabColKeys[c] = key;
-        seenInThisTab.add(key);
         if (!registry.headers.has(key)) {
           registry.keys.push(key);
           registry.headers.set(key, orig);
@@ -272,17 +358,15 @@ async function readSourceSpreadsheet(
       tabResult.columnsContributed =
         registry.keys.length - beforeRegistrySize;
 
-      // Find email column (alias-rich detection from email-utils)
-      const emailColIdx = findEmailColumnIndex(
-        headerStrings.map((h) => h)
+      // Note whether this tab even has an email column — we use this later
+      // to know if the email-dupe highlighting pass is worth running.
+      const tabHasEmail = tabColKeys.some((k) =>
+        EMAIL_ALIASES.includes(k)
       );
+      if (tabHasEmail) emailColumnExisted.value = true;
 
       for (let r = 1; r < rows.length; r++) {
         const row = rows[r] ?? [];
-
-        // Pull each cell, indexed by normalized column key. Empty cells
-        // are not stored — Map.get returns undefined later, and the
-        // merge rule treats undefined / "" as "blank".
         const cellMap = new Map<string, string>();
         let nonEmpty = false;
         for (let c = 0; c < row.length; c++) {
@@ -290,8 +374,6 @@ async function readSourceSpreadsheet(
           if (!key) continue;
           const val = clean(row[c]);
           if (!val) continue;
-          // First non-blank within the SAME row wins (in case of duplicate
-          // headers in a tab — see comment above).
           if (!cellMap.has(key)) {
             cellMap.set(key, val);
           }
@@ -302,41 +384,22 @@ async function readSourceSpreadsheet(
         tabResult.totalRows++;
         counters.totalSourceRows++;
 
-        let normEmail: string | null = null;
-        if (emailColIdx >= 0) {
-          const rawEmail = clean(row[emailColIdx]);
-          normEmail = rawEmail ? normalizeEmail(rawEmail) : null;
-        }
-
-        if (!normEmail) {
-          tabResult.rowsWithoutEmail++;
-          noEmail.push({
-            values: cellMap,
-            firstSeenIdx: counters.nextIdx++,
-          });
-          continue;
-        }
-
-        tabResult.rowsWithEmail++;
-
-        const existing = byEmail.get(normEmail);
-        if (!existing) {
-          byEmail.set(normEmail, {
-            values: cellMap,
-            firstSeenIdx: counters.nextIdx++,
-          });
-          continue;
-        }
-
-        // Merge: fill blanks on existing from newcomer. Existing's
-        // already-set columns are kept (first-seen non-blank wins).
-        counters.duplicatesMerged++;
-        for (const [key, val] of cellMap) {
-          const prev = existing.values.get(key);
-          if (!prev) {
-            existing.values.set(key, val);
+        // Track rows that have an email vs not (purely for reporting)
+        let hasValidEmail = false;
+        for (const k of EMAIL_ALIASES) {
+          const v = cellMap.get(k);
+          if (v && normalizeEmail(v)) {
+            hasValidEmail = true;
+            break;
           }
         }
+        if (hasValidEmail) tabResult.rowsWithEmail++;
+        else {
+          tabResult.rowsWithoutEmail++;
+          counters.rowsWithoutEmail++;
+        }
+
+        allRows.push({ values: cellMap });
       }
 
       results.push(tabResult);
@@ -360,10 +423,14 @@ export async function runConsolidatorSection(
     outputSpreadsheetUrl: "",
     outputTabName: section.outputTabName || "Consolidated",
     totalSourceRows: 0,
-    uniqueRows: 0,
-    duplicatesMerged: 0,
+    totalOutputRows: 0,
     rowsWithoutEmail: 0,
     totalColumns: 0,
+    emailDuplicateValues: 0,
+    emailDuplicateCells: 0,
+    phoneDuplicateValues: 0,
+    phoneDuplicateCells: 0,
+    renewalRulesInstalled: false,
     sources: [],
   };
 
@@ -384,9 +451,9 @@ export async function runConsolidatorSection(
   }
 
   const registry: ColumnRegistry = { keys: [], headers: new Map() };
-  const byEmail = new Map<string, ConsolidatedRow>();
-  const noEmail: ConsolidatedRow[] = [];
-  const counters = { nextIdx: 0, totalSourceRows: 0, duplicatesMerged: 0 };
+  const allRows: ConsolidatedRow[] = [];
+  const emailColumnExisted = { value: false };
+  const counters = { totalSourceRows: 0, rowsWithoutEmail: 0 };
 
   for (const src of section.sources) {
     const sourceResult: ConsolidatorSourceResult = {
@@ -404,8 +471,8 @@ export async function runConsolidatorSection(
           spreadsheetId,
           src.tabs,
           registry,
-          byEmail,
-          noEmail,
+          allRows,
+          emailColumnExisted,
           counters
         );
       }
@@ -418,18 +485,10 @@ export async function runConsolidatorSection(
   }
 
   sectionResult.totalSourceRows = counters.totalSourceRows;
-  sectionResult.duplicatesMerged = counters.duplicatesMerged;
-  sectionResult.rowsWithoutEmail = noEmail.length;
+  sectionResult.rowsWithoutEmail = counters.rowsWithoutEmail;
   sectionResult.totalColumns = registry.keys.length;
+  sectionResult.totalOutputRows = allRows.length;
 
-  const dedupedRows = Array.from(byEmail.values()).sort(
-    (a, b) => a.firstSeenIdx - b.firstSeenIdx
-  );
-  const allRows = [...dedupedRows, ...noEmail];
-  sectionResult.uniqueRows = allRows.length;
-
-  // If we read nothing, still create / clear the output tab so the user
-  // sees a fresh empty Consolidated.
   const headerKeys = registry.keys;
   const headerRow = headerKeys.map((k) => registry.headers.get(k) ?? k);
   const requiredCols = Math.max(headerRow.length, 1);
@@ -444,6 +503,8 @@ export async function runConsolidatorSection(
     );
 
     const safeTab = `'${tabName.replace(/'/g, "''")}'`;
+
+    // Wipe the tab before writing the new union.
     await withRetry(() =>
       sheets.spreadsheets.values.clear({
         spreadsheetId: outputSpreadsheetId,
@@ -451,63 +512,309 @@ export async function runConsolidatorSection(
       })
     );
 
-    if (headerRow.length > 0) {
-      const dataRows = allRows.map((r) =>
-        headerKeys.map((k) => r.values.get(k) ?? "")
-      );
-      const valueRows = [headerRow, ...dataRows];
-      const lastColLetter = columnIndexToLetter(headerRow.length - 1);
+    if (headerRow.length === 0) {
+      sectionResult.outputSpreadsheetUrl = `https://docs.google.com/spreadsheets/d/${outputSpreadsheetId}/edit#gid=${outputSheetId}`;
+      return sectionResult;
+    }
 
+    const dataRows = allRows.map((r) =>
+      headerKeys.map((k) => r.values.get(k) ?? "")
+    );
+    const valueRows = [headerRow, ...dataRows];
+    const lastColLetter = columnIndexToLetter(headerRow.length - 1);
+
+    await withRetry(() =>
+      sheets.spreadsheets.values.update({
+        spreadsheetId: outputSpreadsheetId,
+        range: `${safeTab}!A1:${lastColLetter}${valueRows.length}`,
+        valueInputOption: "RAW",
+        requestBody: { values: valueRows },
+      })
+    );
+
+    // Build the per-feature follow-up requests (header styling, format
+    // resets, duplicate highlights, renewal date conversion + conditional
+    // rules). Sent as one batchUpdate at the end.
+    const formatRequests: sheets_v4.Schema$Request[] = [];
+
+    // (a) Header styling: bold + light bg + freeze first row.
+    formatRequests.push({
+      repeatCell: {
+        range: {
+          sheetId: outputSheetId,
+          startRowIndex: 0,
+          endRowIndex: 1,
+          startColumnIndex: 0,
+          endColumnIndex: headerRow.length,
+        },
+        cell: {
+          userEnteredFormat: {
+            backgroundColor: HEADER_BG,
+            textFormat: { bold: true },
+          },
+        },
+        fields: "userEnteredFormat(backgroundColor,textFormat)",
+      },
+    });
+    formatRequests.push({
+      updateSheetProperties: {
+        properties: {
+          sheetId: outputSheetId,
+          gridProperties: { frozenRowCount: 1 },
+        },
+        fields: "gridProperties.frozenRowCount",
+      },
+    });
+
+    // (b) Wipe any conditional-format rules left over on this tab from a
+    //     previous run (or whatever the user had before). We always own
+    //     this tab — full overwrite.
+    const outputTabInfo = (
       await withRetry(() =>
-        sheets.spreadsheets.values.update({
-          spreadsheetId: outputSpreadsheetId,
-          range: `${safeTab}!A1:${lastColLetter}${valueRows.length}`,
-          valueInputOption: "RAW",
-          requestBody: { values: valueRows },
-        })
-      );
+        sheets.spreadsheets.get({ spreadsheetId: outputSpreadsheetId })
+      )
+    ).data.sheets?.find((t) => t.properties?.sheetId === outputSheetId);
+    const existingRules = outputTabInfo?.conditionalFormats ?? [];
+    for (let i = existingRules.length - 1; i >= 0; i--) {
+      formatRequests.push({
+        deleteConditionalFormatRule: { sheetId: outputSheetId, index: i },
+      });
+    }
 
-      // Best-effort header styling: bold + light bg + freeze first row.
+    // (c) Reset background to white + text to black across the entire data
+    //     range (rows 2..N, cols 0..rowEndCol). Clears any stale formatting
+    //     from a previous run; conditional rules + duplicate highlights are
+    //     applied on top.
+    if (allRows.length > 0) {
+      formatRequests.push({
+        repeatCell: {
+          range: {
+            sheetId: outputSheetId,
+            startRowIndex: 1,
+            endRowIndex: allRows.length + 1,
+            startColumnIndex: 0,
+            endColumnIndex: headerRow.length,
+          },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: { red: 1, green: 1, blue: 1 },
+              textFormat: { foregroundColor: BLACK_TEXT },
+            },
+          },
+          fields:
+            "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.foregroundColor",
+        },
+      });
+    }
+
+    // (d) Email duplicate highlighting (first green, subsequent red).
+    const emailKey = findRegistryKey(registry, EMAIL_ALIASES);
+    if (emailKey && allRows.length > 0) {
+      const emailColIdx = registry.keys.indexOf(emailKey);
+      const emailDupeMap = new Map<string, number[]>();
+      for (let r = 0; r < allRows.length; r++) {
+        const raw = allRows[r].values.get(emailKey);
+        if (!raw) continue;
+        const norm = normalizeEmail(raw);
+        if (!norm) continue;
+        const list = emailDupeMap.get(norm);
+        if (list) list.push(r);
+        else emailDupeMap.set(norm, [r]);
+      }
+      for (const [, rowIndices] of emailDupeMap) {
+        if (rowIndices.length < 2) continue;
+        sectionResult.emailDuplicateValues++;
+        // First = green
+        formatRequests.push(
+          paintCellRequest(
+            outputSheetId,
+            rowIndices[0] + 1,
+            emailColIdx,
+            DUP_GREEN_BG
+          )
+        );
+        for (let i = 1; i < rowIndices.length; i++) {
+          formatRequests.push(
+            paintCellRequest(
+              outputSheetId,
+              rowIndices[i] + 1,
+              emailColIdx,
+              DUP_RED_BG
+            )
+          );
+          sectionResult.emailDuplicateCells++;
+        }
+      }
+    }
+
+    // (e) Phone duplicate highlighting (same rule, strip non-digits).
+    const phoneKey = findRegistryKey(
+      registry,
+      PHONE_ALIASES,
+      PHONE_SUBSTRING_FALLBACKS
+    );
+    if (phoneKey && allRows.length > 0) {
+      const phoneColIdx = registry.keys.indexOf(phoneKey);
+      const phoneDupeMap = new Map<string, number[]>();
+      for (let r = 0; r < allRows.length; r++) {
+        const raw = allRows[r].values.get(phoneKey);
+        if (!raw) continue;
+        const norm = normalizePhoneKey(raw);
+        if (!norm) continue;
+        const list = phoneDupeMap.get(norm);
+        if (list) list.push(r);
+        else phoneDupeMap.set(norm, [r]);
+      }
+      for (const [, rowIndices] of phoneDupeMap) {
+        if (rowIndices.length < 2) continue;
+        sectionResult.phoneDuplicateValues++;
+        formatRequests.push(
+          paintCellRequest(
+            outputSheetId,
+            rowIndices[0] + 1,
+            phoneColIdx,
+            DUP_GREEN_BG
+          )
+        );
+        for (let i = 1; i < rowIndices.length; i++) {
+          formatRequests.push(
+            paintCellRequest(
+              outputSheetId,
+              rowIndices[i] + 1,
+              phoneColIdx,
+              DUP_RED_BG
+            )
+          );
+          sectionResult.phoneDuplicateCells++;
+        }
+      }
+    }
+
+    // (f) Renewal Date column: convert parseable values to real Sheets
+    //     dates (numberValue + DATE format), then install the four tier
+    //     conditional-format rules.
+    const renewalKey = findRegistryKey(registry, RENEWAL_DATE_ALIASES);
+    if (renewalKey && allRows.length > 0) {
+      const renewalColIdx = registry.keys.indexOf(renewalKey);
+
+      // Build one updateCells per parseable date cell. Skip unparseable
+      // cells (they stay as the text we already wrote).
+      for (let r = 0; r < allRows.length; r++) {
+        const raw = allRows[r].values.get(renewalKey) ?? "";
+        if (!raw) continue;
+        const parsed = parseFlexibleDate(raw);
+        if (!parsed) continue;
+        formatRequests.push({
+          updateCells: {
+            rows: [
+              {
+                values: [
+                  {
+                    userEnteredValue: {
+                      numberValue: toSheetsDateSerial(parsed),
+                    },
+                    userEnteredFormat: {
+                      numberFormat: {
+                        type: "DATE",
+                        pattern: "dd/mm/yyyy",
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+            fields: "userEnteredValue,userEnteredFormat.numberFormat",
+            start: {
+              sheetId: outputSheetId,
+              rowIndex: r + 1,
+              columnIndex: renewalColIdx,
+            },
+          },
+        });
+      }
+
+      // Install conditional-format rules over every row in the sheet's
+      // grid (covers future rows too).
+      const sheetRowCount =
+        outputTabInfo?.properties?.gridProperties?.rowCount ??
+        Math.max(allRows.length + 1, 1000);
+      const renewalColLetter = columnIndexToLetter(renewalColIdx);
+      const ref = `$${renewalColLetter}2`;
+      const range: sheets_v4.Schema$GridRange = {
+        sheetId: outputSheetId,
+        startRowIndex: 1,
+        endRowIndex: sheetRowCount,
+        startColumnIndex: 0,
+        endColumnIndex: headerRow.length,
+      };
+
+      const tierRules = [
+        {
+          formula: `=AND(ISNUMBER(${ref}), ${ref}<TODAY())`,
+          bg: DARK_RED_BG,
+          fg: WHITE_TEXT,
+        },
+        {
+          formula: `=AND(ISNUMBER(${ref}), ${ref}>=TODAY(), ${ref}<=TODAY()+4)`,
+          bg: LIGHT_RED_BG,
+          fg: BLACK_TEXT,
+        },
+        {
+          formula: `=AND(ISNUMBER(${ref}), ${ref}>=TODAY()+5, ${ref}<=TODAY()+14)`,
+          bg: LIGHT_YELLOW_BG,
+          fg: BLACK_TEXT,
+        },
+        {
+          formula: `=AND(ISNUMBER(${ref}), ${ref}>=TODAY()+15, ${ref}<=TODAY()+30)`,
+          bg: LIGHT_GREEN_BG,
+          fg: BLACK_TEXT,
+        },
+      ];
+
+      tierRules.forEach((r, idx) => {
+        formatRequests.push({
+          addConditionalFormatRule: {
+            rule: {
+              ranges: [range],
+              booleanRule: {
+                condition: {
+                  type: "CUSTOM_FORMULA",
+                  values: [{ userEnteredValue: r.formula }],
+                },
+                format: {
+                  backgroundColor: r.bg,
+                  textFormat: { foregroundColor: r.fg },
+                },
+              },
+            },
+            index: idx,
+          },
+        });
+      });
+
+      sectionResult.renewalRulesInstalled = true;
+    }
+
+    // Send all format work in chunked batches.
+    const CHUNK_SIZE = 50;
+    for (let i = 0; i < formatRequests.length; i += CHUNK_SIZE) {
+      const slice = formatRequests.slice(i, i + CHUNK_SIZE);
+      if (slice.length === 0) continue;
       try {
         await withRetry(() =>
           sheets.spreadsheets.batchUpdate({
             spreadsheetId: outputSpreadsheetId,
-            requestBody: {
-              requests: [
-                {
-                  repeatCell: {
-                    range: {
-                      sheetId: outputSheetId,
-                      startRowIndex: 0,
-                      endRowIndex: 1,
-                      startColumnIndex: 0,
-                      endColumnIndex: headerRow.length,
-                    },
-                    cell: {
-                      userEnteredFormat: {
-                        backgroundColor: HEADER_BG,
-                        textFormat: { bold: true },
-                      },
-                    },
-                    fields:
-                      "userEnteredFormat(backgroundColor,textFormat)",
-                  },
-                },
-                {
-                  updateSheetProperties: {
-                    properties: {
-                      sheetId: outputSheetId,
-                      gridProperties: { frozenRowCount: 1 },
-                    },
-                    fields: "gridProperties.frozenRowCount",
-                  },
-                },
-              ],
-            },
+            requestBody: { requests: slice },
           })
         );
-      } catch {
-        // styling failure shouldn't fail the section
+      } catch (err) {
+        // Don't fail the whole section over a styling glitch — surface
+        // it on the section result instead and keep going.
+        const msg = err instanceof Error ? err.message : "format error";
+        sectionResult.error = sectionResult.error
+          ? `${sectionResult.error}; ${msg}`
+          : `Formatting partially applied: ${msg}`;
+        break;
       }
     }
 
@@ -518,6 +825,29 @@ export async function runConsolidatorSection(
   }
 
   return sectionResult;
+}
+
+function paintCellRequest(
+  sheetId: number,
+  rowIndex: number,
+  colIndex: number,
+  bg: { red: number; green: number; blue: number }
+): sheets_v4.Schema$Request {
+  return {
+    repeatCell: {
+      range: {
+        sheetId,
+        startRowIndex: rowIndex,
+        endRowIndex: rowIndex + 1,
+        startColumnIndex: colIndex,
+        endColumnIndex: colIndex + 1,
+      },
+      cell: {
+        userEnteredFormat: { backgroundColor: bg },
+      },
+      fields: "userEnteredFormat.backgroundColor",
+    },
+  };
 }
 
 /**
@@ -540,10 +870,14 @@ export async function runConsolidatorBatch(
         outputSpreadsheetUrl: "",
         outputTabName: section.outputTabName || "Consolidated",
         totalSourceRows: 0,
-        uniqueRows: 0,
-        duplicatesMerged: 0,
+        totalOutputRows: 0,
         rowsWithoutEmail: 0,
         totalColumns: 0,
+        emailDuplicateValues: 0,
+        emailDuplicateCells: 0,
+        phoneDuplicateValues: 0,
+        phoneDuplicateCells: 0,
+        renewalRulesInstalled: false,
         sources: [],
         error: err instanceof Error ? err.message : "Section failed",
       });

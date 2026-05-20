@@ -5,6 +5,7 @@ import {
   normalizeEmail,
 } from "./email-utils";
 import { withRetry } from "./retry";
+import { parseFlexibleDate, toSheetsDateSerial } from "./sheet-dates";
 import { sheets_v4 } from "googleapis";
 
 const HEADER_BG = { red: 0.93, green: 0.93, blue: 0.96 };
@@ -25,19 +26,6 @@ const WHITE_TEXT = { red: 1, green: 1, blue: 1 };
 // automatically every day (and on every cell edit) without re-running sync.
 type RenewalTier = "past" | "imminent" | "soon" | "later" | "none";
 
-// Google Sheets serial date epoch: 1899-12-30 (anchored to absorb the
-// historical Lotus 1-2-3 leap-year-1900 bug). Using UTC-based math so the
-// server's timezone never shifts the result by ±1 day.
-const SHEETS_DATE_EPOCH_UTC_MS = Date.UTC(1899, 11, 30);
-
-function toSheetsDateSerial(d: Date): number {
-  const y = d.getFullYear();
-  const m = d.getMonth();
-  const day = d.getDate();
-  return Math.floor(
-    (Date.UTC(y, m, day) - SHEETS_DATE_EPOCH_UTC_MS) / 86400000
-  );
-}
 
 const FIELDS = [
   "courseName",
@@ -156,40 +144,6 @@ function findHeaderIndex(headers: string[], aliases: string[]): number {
   return -1;
 }
 
-function parseFlexibleDate(raw: string): Date | null {
-  const str = raw.trim();
-  if (!str) return null;
-
-  // ISO YYYY-MM-DD (or YYYY/MM/DD)
-  const iso = str.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})/);
-  if (iso) {
-    const d = new Date(parseInt(iso[1]), parseInt(iso[2]) - 1, parseInt(iso[3]));
-    if (!isNaN(d.getTime())) return d;
-  }
-
-  // DD/MM/YYYY (European default — user's data is Italian)
-  // Falls back to MM/DD/YYYY if first part > 12
-  const parts = str.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
-  if (parts) {
-    let a = parseInt(parts[1]);
-    let b = parseInt(parts[2]);
-    let year = parseInt(parts[3]);
-    if (year < 100) year += 2000;
-
-    // If first > 12 → must be DD/MM. Otherwise default to DD/MM (Italian).
-    // Only swap when first ≤ 12 AND second > 12 (unambiguously MM/DD).
-    if (a <= 12 && b > 12) {
-      [a, b] = [b, a];
-    }
-    const d = new Date(year, b - 1, a);
-    if (!isNaN(d.getTime())) return d;
-  }
-
-  const fallback = new Date(str);
-  if (!isNaN(fallback.getTime())) return fallback;
-
-  return null;
-}
 
 /**
  * Classify a renewal date into one of five proximity tiers relative to today.
