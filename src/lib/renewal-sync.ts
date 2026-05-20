@@ -40,7 +40,6 @@ function toSheetsDateSerial(d: Date): number {
 }
 
 const FIELDS = [
-  "phone",
   "courseName",
   "startDate",
   "renewalDate",
@@ -55,7 +54,6 @@ type FieldKey = (typeof FIELDS)[number];
 const COMPUTED_FIELDS: Set<FieldKey> = new Set(["subscriptionType"]);
 
 const CANONICAL_HEADERS: Record<FieldKey, string> = {
-  phone: "Phone",
   courseName: "Course name",
   startDate: "Start date",
   renewalDate: "Renewal Date",
@@ -97,7 +95,6 @@ function classifySubscription(courseName: string): string {
 // Aliases are matched against the header after lowercasing, trimming, and
 // collapsing internal whitespace — so casing and extra spaces don't matter.
 const HEADER_ALIASES: Record<FieldKey, string[]> = {
-  phone: ["phone", "phone number", "telefono", "mobile", "cellulare"],
   courseName: [
     "course name",
     "course",
@@ -302,7 +299,6 @@ async function buildLookupMap(
       if (map.has(email)) continue; // first occurrence wins
 
       const data: LookupData = {
-        phone: "",
         courseName: "",
         startDate: "",
         renewalDate: "",
