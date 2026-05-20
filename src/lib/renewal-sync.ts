@@ -22,10 +22,20 @@ const CANONICAL_HEADERS: Record<FieldKey, string> = {
   setterAssigned: "Setter assigned",
 };
 
-// Accept common variants (English + Italian) when locating columns
+// Accept common variants (English + Italian) when locating columns.
+// Aliases are matched against the header after lowercasing, trimming, and
+// collapsing internal whitespace — so casing and extra spaces don't matter.
 const HEADER_ALIASES: Record<FieldKey, string[]> = {
   phone: ["phone", "phone number", "telefono", "mobile", "cellulare"],
-  courseName: ["course name", "course", "corso", "nome corso"],
+  courseName: [
+    "course name",
+    "course",
+    "corso",
+    "nome corso",
+    "subscription / course name", // exact literal header users have in their lookup sheets
+    "subscription/course name", // no-space variant — defensive
+    "subscription",
+  ],
   startDate: ["start date", "start", "data inizio", "inizio", "data di inizio"],
   renewalDate: ["renewal date", "renewal", "data rinnovo", "rinnovo", "data di rinnovo"],
   setterAssigned: ["setter assigned", "setter", "assigned setter", "assegnato"],
