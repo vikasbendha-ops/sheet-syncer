@@ -39,8 +39,20 @@ function toSheetsDateSerial(d: Date): number {
   );
 }
 
-const FIELDS = ["phone", "courseName", "startDate", "renewalDate", "setterAssigned"] as const;
+const FIELDS = [
+  "phone",
+  "courseName",
+  "startDate",
+  "renewalDate",
+  "setterAssigned",
+  "subscriptionType",
+] as const;
 type FieldKey = (typeof FIELDS)[number];
+
+// Fields whose value is COMPUTED from other fields (not pulled from the
+// lookup spreadsheet). buildLookupMap skips these when scanning for columns,
+// and the post-processing step in buildLookupMap fills them.
+const COMPUTED_FIELDS: Set<FieldKey> = new Set(["subscriptionType"]);
 
 const CANONICAL_HEADERS: Record<FieldKey, string> = {
   phone: "Phone",
@@ -48,7 +60,38 @@ const CANONICAL_HEADERS: Record<FieldKey, string> = {
   startDate: "Start date",
   renewalDate: "Renewal Date",
   setterAssigned: "Setter assigned",
+  subscriptionType: "TYPE OF SUBSCRIPTION",
 };
+
+// Dropdown options for the TYPE OF SUBSCRIPTION column. Installed as a Google
+// Sheets data validation rule (ONE_OF_LIST) on the column each sync run.
+const SUBSCRIPTION_OPTIONS = [
+  "BAL",
+  "BAC",
+  "ELITE",
+  "GOLD",
+  "NMM",
+] as const;
+
+/**
+ * Map a Course name string to one of the SUBSCRIPTION_OPTIONS, or "" if
+ * nothing matches (cell left empty / user can pick manually). Match is
+ * case-insensitive substring.
+ *
+ * NMM has no auto-rule — it lives in the dropdown but only via manual pick.
+ *
+ * Order matters only for clarity; the rules are mutually exclusive in
+ * practice (a Course name in the real data is one of the four families).
+ */
+function classifySubscription(courseName: string): string {
+  if (!courseName) return "";
+  const c = courseName.toLowerCase();
+  if (c.includes("biz academy club")) return "BAC";
+  if (c.includes("biz academy light")) return "BAL";
+  if (c.includes("biz academy elite") || c.includes("elite")) return "ELITE";
+  if (c.includes("biz academy gold") || c.includes("gold")) return "GOLD";
+  return "";
+}
 
 // Accept common variants (English + Italian) when locating columns.
 // Aliases are matched against the header after lowercasing, trimming, and
@@ -77,6 +120,13 @@ const HEADER_ALIASES: Record<FieldKey, string[]> = {
     "expiry",
   ],
   setterAssigned: ["setter assigned", "setter", "assigned setter", "assegnato"],
+  subscriptionType: [
+    "type of subscription",
+    "subscription type",
+    "tipo di abbonamento",
+    "tipo abbonamento",
+    "abbonamento",
+  ],
 };
 
 type LookupData = Record<FieldKey, string>;
@@ -206,6 +256,7 @@ async function buildLookupMap(
 
     const fieldIdx: Partial<Record<FieldKey, number>> = {};
     for (const f of FIELDS) {
+      if (COMPUTED_FIELDS.has(f)) continue; // not pulled from lookup
       const idx = findHeaderIndex(headers, HEADER_ALIASES[f]);
       if (idx === -1) {
         missingHeaders.add(CANONICAL_HEADERS[f]);
@@ -256,13 +307,17 @@ async function buildLookupMap(
         startDate: "",
         renewalDate: "",
         setterAssigned: "",
+        subscriptionType: "",
       };
       for (const f of FIELDS) {
+        if (COMPUTED_FIELDS.has(f)) continue; // computed after lookup read
         const cell = fieldRows[f]?.[i]?.[0];
         if (cell !== undefined && cell !== null) {
           data[f] = String(cell).trim();
         }
       }
+      // Derived field: classify subscription type from courseName
+      data.subscriptionType = classifySubscription(data.courseName);
       map.set(email, data);
     }
   }
@@ -567,6 +622,33 @@ async function processSourceTab(
         index: idx,
       },
     });
+  });
+
+  // 5. Install the TYPE OF SUBSCRIPTION dropdown (data validation) on the
+  //    subscriptionType column. Re-run safe: setDataValidation overwrites
+  //    any prior rule on the same range without piling them up. Per-value
+  //    chip colors live on the cells themselves once the user sets them in
+  //    the Sheets UI — that styling is NOT overwritten by setDataValidation.
+  requests.push({
+    setDataValidation: {
+      range: {
+        sheetId,
+        startRowIndex: 1, // skip header
+        endRowIndex: sheetRowCount,
+        startColumnIndex: targetCol.subscriptionType,
+        endColumnIndex: targetCol.subscriptionType + 1,
+      },
+      rule: {
+        condition: {
+          type: "ONE_OF_LIST",
+          values: SUBSCRIPTION_OPTIONS.map((v) => ({
+            userEnteredValue: v,
+          })),
+        },
+        strict: true,
+        showCustomUi: true,
+      },
+    },
   });
 
   // Row-paint adds N requests for an N-row tab; bumping chunk size keeps
