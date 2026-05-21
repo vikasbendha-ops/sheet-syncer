@@ -34,6 +34,8 @@ Next.js 16 App Router + React 19 + TypeScript strict. Tailwind v4 via `@tailwind
 - `_biz_tutor_config` — `src/lib/biz-tutor-config-store.ts`
 - `_consolidator_config` — `src/lib/consolidator-config-store.ts`
 - `_sync_pro_config` — `src/lib/sync-pro-config-store.ts`
+- `_multi_sync_config` — `src/lib/multi-sync-config-store.ts`
+- `_multi_sync_meta` — single integer (next monotonic slot for Multi Sync sections, never decrements)
 - `Master` — output of the main sync (`src/lib/sheets-writer.ts`). Cleared and rewritten in full on each sync.
 - `Domains - <tab>` — output of the domain analyzer.
 
@@ -79,7 +81,9 @@ src/app/api/<feature>/config/route.ts       # GET/PUT config
 src/app/<feature>/page.tsx                  # client UI
 ```
 
-Existing features: main sync (`sync-engine`), `email-finder`, `biz-tutor-sync`, `renewal-sync`, `report-sync`, `domain-analyzer`, `consolidator`, `duplicate-finder`, `sync-pro`. The main sync is the only one that uses `_config` — the others use their own `_<feature>_config` tab and don't share state.
+Existing features: main sync (`sync-engine`), `email-finder`, `biz-tutor-sync`, `renewal-sync`, `report-sync`, `domain-analyzer`, `consolidator`, `duplicate-finder`, `sync-pro`, `multi-sync`. The main sync is the only one that uses `_config` — the others use their own `_<feature>_config` tab and don't share state.
+
+`multi-sync` is the basic Present In sync wrapped in the multi-section pattern. Same engine behavior as the basic main sync (read linked sheets → cross-reference by lowercased email → write a "Present In" deep-link column into each source sheet → write a `[Name, Email, ✅/❌]` Master tab) but each section has its own linked sheets, its own master tab, and its own **uniquely-named** Present In column. Defaults are `Multi Master - <slot>` and `Present In - <slot>`, where `slot` is a permanent monotonic counter stored in `_multi_sync_meta`. The counter never decrements: deleting a section means its slot is permanently burned, so renaming/recreating can never collide with a previously-used Present In column. Each section's run only ever touches the column whose header exactly equals `section.presentInColumnName` — basic sync's unsuffixed "Present In" column is left alone. Per-section, per-linked-sheet `lastSynced` is tracked on the config row. Uniqueness of `presentInColumnName` is validated at the API + config-store level. The prefix-folding name-merge logic is duplicated from `sync-engine.ts` so basic sync stays 100% untouched. The shared `writePresentInColumn` helper gained an optional `headerText` parameter (default `"Present In"` — additive, backwards compatible) so Multi Sync can pass its per-section column name.
 
 `sync-pro` is the multi-section, column-propagation sibling of the basic main sync. Each section has its own linked-sheets list, propagate-columns list, per-sheet column mapping, and master-tab name. Within a section: read every linked sheet, build a cross-reference by lowercased email, then for each logical propagate column fill any blank cell using the non-blank value from another linked sheet (never overwrite an existing non-blank value). Multiple non-blank values that disagree are surfaced in `result.conflicts` rather than touched. After propagation, the existing `writePresentInColumn` helper adds a "Present In" deep-link column to each source sheet (toggleable per section), and the section writes a `[Name, Email, ✅/❌ per sheet]` Master tab into the user's master spreadsheet at `section.masterTabName` (defaults to `Pro: <section name>`). The prefix-folding name-merge logic is duplicated verbatim from `sync-engine.ts` so the basic sync stays 100% untouched. Sections are run independently via per-section `Run section` buttons (or "Run all N sections"); per-section failures don't abort the batch.
 
