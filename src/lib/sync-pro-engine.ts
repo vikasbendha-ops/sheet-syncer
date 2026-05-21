@@ -12,7 +12,6 @@ import { writePresentInColumn } from "./present-in-writer";
 import { sheets_v4 } from "googleapis";
 import type {
   ProBatchResult,
-  ProColumnStats,
   ProConflict,
   ProLinkedSheet,
   ProSection,
@@ -476,15 +475,153 @@ export async function runSyncProSection(
   }
   result.totalUniqueEmails = crossRef.size;
 
-  // Stash outcomes + crossRef on a local object that subsequent tasks
-  // (propagation + present-in + master tab writes) will consume. For now
-  // we early-return with read stats only; Tasks 6-7 fill in the rest.
-  void crossRef;
+  // ----- Propagation pass -----
+  //
+  // For each logical propagate column, look at every email present in 2+
+  // linked sheets. Bucket the per-sheet values into blanks vs non-blanks:
+  //
+  //   0 non-blank          → nothing to do
+  //   1 non-blank          → propagate that value into every blank cell
+  //   2+ non-blank, equal  → same (treat as one value)
+  //   2+ non-blank, differ → CONFLICT. Don't write anything. Log it.
+  //
+  // "Equal" is case-insensitive after trimming + collapsing whitespace
+  // (same notion of equality we use everywhere else in this codebase).
+
+  function normForCompare(s: string): string {
+    return s.toLowerCase().trim().replace(/\s+/g, " ");
+  }
+
+  // Per-sheet collected writes: linkedSheetIdx → array of cell writes
+  interface PendingCellWrite {
+    rowNumber: number; // 1-based
+    colIdx: number; // 0-based
+    value: string;
+  }
+  const pendingPerSheet = new Map<number, PendingCellWrite[]>();
+
+  for (const col of section.propagateColumns) {
+    const stats = result.columnStats.find((c) => c.name === col.name);
+    if (!stats) continue;
+
+    for (const [email, locations] of crossRef) {
+      if (locations.length < 2) continue;
+
+      // Collect this column's value from each sheet that actually mapped it
+      const perSheetValue: Array<{
+        linkedSheetIdx: number;
+        sheetIdx: number; // index in outcomes[]
+        value: string;
+      }> = [];
+      for (const loc of locations) {
+        const outcome = outcomes[loc.linkedSheetIdx];
+        const idx = outcome.logicalColIndex.get(col.name) ?? -1;
+        if (idx < 0) continue; // sheet skipped this column
+        const rec = outcome.byEmail.get(email);
+        const v = rec?.perColumn.get(col.name) ?? "";
+        perSheetValue.push({
+          linkedSheetIdx: loc.linkedSheetIdx,
+          sheetIdx: loc.linkedSheetIdx,
+          value: v,
+        });
+      }
+
+      if (perSheetValue.length < 2) continue;
+
+      const blanks = perSheetValue.filter((p) => !p.value);
+      const nonBlanks = perSheetValue.filter((p) => p.value);
+      if (nonBlanks.length === 0) continue;
+      if (blanks.length === 0) {
+        // All sheets that mapped this column already have a value.
+        // Conflict-check (logged but never overwritten).
+        const distinct = new Set(nonBlanks.map((n) => normForCompare(n.value)));
+        if (distinct.size > 1) {
+          stats.conflicts++;
+          result.totalConflicts++;
+          result.conflicts.push({
+            email,
+            column: col.name,
+            values: nonBlanks.map((n) => ({
+              nickname:
+                section.linkedSheets[n.linkedSheetIdx]?.nickname ?? "?",
+              value: n.value,
+            })),
+          });
+        }
+        continue;
+      }
+
+      const distinctNonBlank = new Set(
+        nonBlanks.map((n) => normForCompare(n.value))
+      );
+      if (distinctNonBlank.size > 1) {
+        stats.conflicts++;
+        result.totalConflicts++;
+        result.conflicts.push({
+          email,
+          column: col.name,
+          values: nonBlanks.map((n) => ({
+            nickname: section.linkedSheets[n.linkedSheetIdx]?.nickname ?? "?",
+            value: n.value,
+          })),
+        });
+        continue;
+      }
+
+      // Single value (or all equal) → propagate into every blank cell.
+      const valueToWrite = nonBlanks[0].value;
+      for (const b of blanks) {
+        const outcome = outcomes[b.linkedSheetIdx];
+        const rec = outcome.byEmail.get(email);
+        const colIdx = outcome.logicalColIndex.get(col.name) ?? -1;
+        if (!rec || colIdx < 0) continue;
+        const writes = pendingPerSheet.get(b.linkedSheetIdx) ?? [];
+        writes.push({
+          rowNumber: rec.rowNumber,
+          colIdx,
+          value: valueToWrite,
+        });
+        pendingPerSheet.set(b.linkedSheetIdx, writes);
+        stats.cellsFilled++;
+        result.totalCellsFilled++;
+      }
+    }
+  }
+
+  // Apply per-sheet writes (one values.batchUpdate per sheet, parallelized
+  // under MAX_CONCURRENCY).
+  const writeTasks: Array<() => Promise<void>> = [];
+  for (const [sheetIdx, writes] of pendingPerSheet) {
+    if (!writes.length) continue;
+    const outcome = outcomes[sheetIdx];
+    const linked = section.linkedSheets[sheetIdx];
+    const tabResult = result.linkedSheets[sheetIdx];
+    const safeTab = `'${linked.tabName.replace(/'/g, "''")}'`;
+    const data = writes.map((w) => ({
+      range: `${safeTab}!${columnIndexToLetter(w.colIdx)}${w.rowNumber}`,
+      values: [[w.value]],
+    }));
+    writeTasks.push(async () => {
+      try {
+        await withRetry(() =>
+          sheetsClient.spreadsheets.values.batchUpdate({
+            spreadsheetId: outcome.spreadsheetId,
+            requestBody: { valueInputOption: "USER_ENTERED", data },
+          })
+        );
+        tabResult.cellsFilled = writes.length;
+      } catch (err) {
+        tabResult.error = `${tabResult.error ? tabResult.error + "; " : ""}Failed to write propagated cells: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    });
+  }
+  await withConcurrencyLimit(writeTasks, MAX_CONCURRENCY);
+
+  // Present In + Master tab writes land in Task 7.
   void writePresentInColumn;
   void mergeNamesForEmail;
   void HEADER_BG;
   void masterSheetId;
-  void ({} as ProColumnStats);
   void ({} as ProConflict);
   return result;
 }
