@@ -562,6 +562,73 @@ function SectionCard({
         </label>
       </div>
 
+      {/* Propagate columns */}
+      <div className="space-y-2">
+        <p className="text-xs font-medium text-muted uppercase tracking-wide">
+          Propagate columns ({section.propagateColumns.length})
+        </p>
+        <div className="flex flex-wrap gap-2 items-center">
+          {section.propagateColumns.map((col, cIdx) => (
+            <span
+              key={`${col.name}-${cIdx}`}
+              className="inline-flex items-center gap-1 bg-background border border-border rounded-md px-2 py-1 text-sm"
+            >
+              <code>{col.name}</code>
+              <button
+                type="button"
+                onClick={() => {
+                  const removedName = col.name;
+                  const nextCols = section.propagateColumns.filter(
+                    (_, i) => i !== cIdx
+                  );
+                  const nextLinked = section.linkedSheets.map((l) => {
+                    const { [removedName]: _removed, ...rest } =
+                      l.columnMapping;
+                    void _removed;
+                    return { ...l, columnMapping: rest };
+                  });
+                  onChangeSection({
+                    propagateColumns: nextCols,
+                    linkedSheets: nextLinked,
+                  });
+                }}
+                className="text-danger hover:underline cursor-pointer"
+                aria-label={`Remove ${col.name}`}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+          <AddPropagateColumn
+            onAdd={(name) => {
+              const trimmed = name.trim();
+              if (!trimmed) return;
+              if (
+                section.propagateColumns.some(
+                  (c) => c.name.toLowerCase() === trimmed.toLowerCase()
+                )
+              ) {
+                return;
+              }
+              onChangeSection({
+                propagateColumns: [
+                  ...section.propagateColumns,
+                  { name: trimmed },
+                ],
+              });
+            }}
+          />
+        </div>
+        {section.propagateColumns.length === 0 && (
+          <p className="text-xs text-muted">
+            No propagate columns yet. Add one — e.g.{" "}
+            <code className="bg-background px-1 rounded">Phone</code> — and
+            map it to each linked sheet&apos;s actual header below. Pro will
+            fill blanks across sheets for these columns.
+          </p>
+        )}
+      </div>
+
       {/* Linked sheets list */}
       <div className="space-y-3">
         <p className="text-xs font-medium text-muted uppercase tracking-wide">
@@ -627,7 +694,7 @@ function LinkedSheetRow({
   linked,
   index,
   total,
-  propagateColumns: _propagateColumns,
+  propagateColumns,
   onChange,
   onRemove,
   onFetch,
@@ -640,7 +707,6 @@ function LinkedSheetRow({
   onRemove: () => void;
   onFetch: () => void;
 }) {
-  void _propagateColumns; // mapping UI lands in Task 12
   return (
     <div className="border border-border rounded-md p-3 space-y-3 bg-background/50">
       <div className="flex items-center justify-between gap-2">
@@ -724,6 +790,90 @@ function LinkedSheetRow({
           </label>
         </div>
       )}
+
+      {propagateColumns.length > 0 && linked.ui.loadedTabs.length > 0 && (
+        <div className="space-y-2 border-t border-border pt-3">
+          <p className="text-xs font-medium text-muted uppercase tracking-wide">
+            Column mapping
+          </p>
+          <p className="text-[11px] text-muted">
+            Type the header text from <code>{linked.tabName || "this tab"}</code>{" "}
+            that should feed each section column. Leave blank to skip this
+            sheet for that column.
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {propagateColumns.map((col) => (
+              <label
+                key={col.name}
+                className="flex items-center gap-2 text-xs"
+              >
+                <span className="font-medium w-24 truncate">{col.name}</span>
+                <input
+                  type="text"
+                  value={linked.columnMapping[col.name] ?? ""}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    onChange({
+                      columnMapping: {
+                        ...linked.columnMapping,
+                        [col.name]: v ? v : null,
+                      },
+                    });
+                  }}
+                  placeholder="(skip)"
+                  className="flex-1 min-w-0 border border-border rounded-md px-2 py-1 text-xs bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary"
+                />
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+// ---------- AddPropagateColumn ----------
+
+function AddPropagateColumn({ onAdd }: { onAdd: (name: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState("");
+  if (!editing) {
+    return (
+      <button
+        type="button"
+        onClick={() => setEditing(true)}
+        className="text-xs font-medium px-2 py-1 rounded-md border border-dashed border-border bg-background hover:bg-card transition-colors cursor-pointer"
+      >
+        + Add column
+      </button>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1">
+      <input
+        autoFocus
+        type="text"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            onAdd(value);
+            setValue("");
+            setEditing(false);
+          } else if (e.key === "Escape") {
+            setValue("");
+            setEditing(false);
+          }
+        }}
+        onBlur={() => {
+          if (value.trim()) onAdd(value);
+          setValue("");
+          setEditing(false);
+        }}
+        placeholder="Phone"
+        className="border border-border rounded-md px-2 py-1 text-xs bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary w-24"
+      />
+    </span>
   );
 }
