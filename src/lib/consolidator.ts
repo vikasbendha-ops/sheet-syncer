@@ -2,6 +2,7 @@ import { getSheetsClient } from "./google-auth";
 import { withRetry } from "./retry";
 import { normalizeEmail, columnIndexToLetter } from "./email-utils";
 import { extractSpreadsheetId } from "./url-parser";
+import { parseSheetsDateLike } from "./sheet-dates";
 import { sheets_v4 } from "googleapis";
 
 /**
@@ -531,6 +532,24 @@ export async function runConsolidatorSection(
   sectionResult.totalColumns = registry.keys.length;
   sectionResult.totalOutputRows = allRows.length;
 
+  // Sort by renewal date ascending so the closest / most-overdue renewals
+  // appear at the top of the output. Rows with no parseable renewal value
+  // sink to the bottom in their original insertion order (Array.prototype.sort
+  // is stable in modern JS).
+  const renewalKeyForSort = findRegistryKey(registry, RENEWAL_DATE_ALIASES);
+  if (renewalKeyForSort) {
+    allRows.sort((a, b) => {
+      const aRaw = a.values.get(renewalKeyForSort) ?? "";
+      const bRaw = b.values.get(renewalKeyForSort) ?? "";
+      const aDate = aRaw ? parseSheetsDateLike(aRaw) : null;
+      const bDate = bRaw ? parseSheetsDateLike(bRaw) : null;
+      if (aDate && bDate) return aDate.getTime() - bDate.getTime();
+      if (aDate && !bDate) return -1;
+      if (!aDate && bDate) return 1;
+      return 0;
+    });
+  }
+
   const headerKeys = registry.keys;
   const headerRow = headerKeys.map((k) => registry.headers.get(k) ?? k);
   const requiredCols = Math.max(headerRow.length, 1);
@@ -649,14 +668,23 @@ export async function runConsolidatorSection(
       });
     }
 
+    // Track email / phone column indices in outer scope so the renewal
+    // conditional-format range below can EXCLUDE them — that way the
+    // row tier color doesn't paint over the dupe highlights on those
+    // two cells. (Sheets' conditional formatting takes precedence over
+    // manual cell formatting, so without this exclusion the dupe colors
+    // disappear under the renewal tier color.)
+    let emailColIdx = -1;
+    let phoneColIdx = -1;
+
     // (d) Email duplicate highlighting (first green, subsequent red).
     const emailKey = findRegistryKey(registry, EMAIL_ALIASES);
     if (emailKey) {
       sectionResult.emailColumnHeader =
         registry.headers.get(emailKey) ?? emailKey;
+      emailColIdx = registry.keys.indexOf(emailKey);
     }
     if (emailKey && allRows.length > 0) {
-      const emailColIdx = registry.keys.indexOf(emailKey);
       const emailDupeMap = new Map<string, number[]>();
       for (let r = 0; r < allRows.length; r++) {
         const raw = allRows[r].values.get(emailKey);
@@ -702,9 +730,9 @@ export async function runConsolidatorSection(
     if (phoneKey) {
       sectionResult.phoneColumnHeader =
         registry.headers.get(phoneKey) ?? phoneKey;
+      phoneColIdx = registry.keys.indexOf(phoneKey);
     }
     if (phoneKey && allRows.length > 0) {
-      const phoneColIdx = registry.keys.indexOf(phoneKey);
       const phoneDupeMap = new Map<string, number[]>();
       for (let r = 0; r < allRows.length; r++) {
         const raw = allRows[r].values.get(phoneKey);
@@ -809,13 +837,48 @@ export async function runConsolidatorSection(
       });
 
       const ref = `$${renewalColLetter}2`;
-      const range: sheets_v4.Schema$GridRange = {
-        sheetId: outputSheetId,
-        startRowIndex: 1,
-        endRowIndex: sheetRowCount,
-        startColumnIndex: 0,
-        endColumnIndex: headerRow.length,
-      };
+
+      // Build the rule's ranges so they cover every column EXCEPT the
+      // Email + Phone columns. This leaves the per-cell dupe highlights
+      // (manual cell formatting on those two cells) visible — otherwise
+      // the conditional row-tier color overlays and hides them.
+      const excludedCols = [emailColIdx, phoneColIdx]
+        .filter((i) => i >= 0)
+        .sort((a, b) => a - b);
+      const conditionalRanges: sheets_v4.Schema$GridRange[] = [];
+      let cursor = 0;
+      for (const ex of excludedCols) {
+        if (ex > cursor) {
+          conditionalRanges.push({
+            sheetId: outputSheetId,
+            startRowIndex: 1,
+            endRowIndex: sheetRowCount,
+            startColumnIndex: cursor,
+            endColumnIndex: ex,
+          });
+        }
+        cursor = ex + 1;
+      }
+      if (cursor < headerRow.length) {
+        conditionalRanges.push({
+          sheetId: outputSheetId,
+          startRowIndex: 1,
+          endRowIndex: sheetRowCount,
+          startColumnIndex: cursor,
+          endColumnIndex: headerRow.length,
+        });
+      }
+      // Fallback: if no email/phone columns were detected, cover the
+      // whole row.
+      if (conditionalRanges.length === 0) {
+        conditionalRanges.push({
+          sheetId: outputSheetId,
+          startRowIndex: 1,
+          endRowIndex: sheetRowCount,
+          startColumnIndex: 0,
+          endColumnIndex: headerRow.length,
+        });
+      }
 
       const tierRules = [
         {
@@ -844,7 +907,7 @@ export async function runConsolidatorSection(
         formatRequests.push({
           addConditionalFormatRule: {
             rule: {
-              ranges: [range],
+              ranges: conditionalRanges,
               booleanRule: {
                 condition: {
                   type: "CUSTOM_FORMULA",
