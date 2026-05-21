@@ -31,6 +31,10 @@ interface SectionResult {
   phoneDuplicateValues: number;
   phoneDuplicateCells: number;
   renewalRulesInstalled: boolean;
+  renewalDateHeader: string | null;
+  renewalDateCellsConverted: number;
+  emailColumnHeader: string | null;
+  phoneColumnHeader: string | null;
   sources: SourceResult[];
   error?: string;
 }
@@ -803,13 +807,54 @@ function InlineResult({ result }: { result: SectionResult }) {
               accent={result.rowsWithoutEmail > 0 ? "danger" : "muted"}
             />
           </div>
-          {result.renewalRulesInstalled && (
-            <p className="text-xs text-success bg-success/10 rounded-md px-3 py-2">
-              Renewal Date column detected — 4-tier conditional formatting
-              installed (past / 0-4d / 5-14d / 15-30d). Sheets re-evaluates
-              it daily.
-            </p>
-          )}
+          <div className="text-xs text-muted bg-background border border-border rounded-md px-3 py-2 space-y-1">
+            <div>
+              Email column:{" "}
+              {result.emailColumnHeader ? (
+                <code className="bg-card px-1 rounded">
+                  {result.emailColumnHeader}
+                </code>
+              ) : (
+                <span className="text-danger">not detected</span>
+              )}
+            </div>
+            <div>
+              Phone column:{" "}
+              {result.phoneColumnHeader ? (
+                <code className="bg-card px-1 rounded">
+                  {result.phoneColumnHeader}
+                </code>
+              ) : (
+                <span className="text-danger">not detected</span>
+              )}
+            </div>
+            <div>
+              Renewal Date column:{" "}
+              {result.renewalDateHeader ? (
+                <>
+                  <code className="bg-card px-1 rounded">
+                    {result.renewalDateHeader}
+                  </code>{" "}
+                  · {result.renewalDateCellsConverted} cell
+                  {result.renewalDateCellsConverted === 1 ? "" : "s"}{" "}
+                  converted to real dates
+                  {result.renewalRulesInstalled && (
+                    <>
+                      {" "}
+                      ·{" "}
+                      <span className="text-success">
+                        4 conditional-format rules installed
+                      </span>
+                    </>
+                  )}
+                </>
+              ) : (
+                <span className="text-muted">
+                  not detected — no conditional formatting applied
+                </span>
+              )}
+            </div>
+          </div>
 
           <div className="space-y-3 mt-3">
             {result.sources.map((src, i) => (

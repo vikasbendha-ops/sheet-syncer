@@ -2,7 +2,7 @@ import { getSheetsClient } from "./google-auth";
 import { withRetry } from "./retry";
 import { normalizeEmail, columnIndexToLetter } from "./email-utils";
 import { extractSpreadsheetId } from "./url-parser";
-import { parseFlexibleDate, toSheetsDateSerial } from "./sheet-dates";
+import { parseSheetsDateLike, toSheetsDateSerial } from "./sheet-dates";
 import { sheets_v4 } from "googleapis";
 
 /**
@@ -160,6 +160,14 @@ export interface ConsolidatorSectionResult {
   phoneDuplicateValues: number;
   phoneDuplicateCells: number;
   renewalRulesInstalled: boolean;
+  /** Original header text of the detected Renewal Date column, or null. */
+  renewalDateHeader: string | null;
+  /** Cells in the renewal date column that were converted to real Sheets dates. */
+  renewalDateCellsConverted: number;
+  /** Original header text of the detected Email column, or null. */
+  emailColumnHeader: string | null;
+  /** Original header text of the detected Phone column, or null. */
+  phoneColumnHeader: string | null;
   sources: ConsolidatorSourceResult[];
   error?: string;
 }
@@ -173,8 +181,17 @@ interface ConsolidatedRow {
   values: Map<string, string>; // normalized column key → cell value
 }
 
+// Strip ZWSP / ZWNJ / ZWJ / BOM, then lower + collapse whitespace. Some
+// sheets pasted from external tools carry invisible chars in header cells
+// which would otherwise break alias matching.
+const ZERO_WIDTH_RE = /[​‌‍﻿]/g;
+
 function normalizeColumnKey(header: string): string {
-  return header.trim().toLowerCase().replace(/\s+/g, " ");
+  return header
+    .replace(ZERO_WIDTH_RE, "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
 }
 
 function clean(value: unknown): string {
@@ -431,6 +448,10 @@ export async function runConsolidatorSection(
     phoneDuplicateValues: 0,
     phoneDuplicateCells: 0,
     renewalRulesInstalled: false,
+    renewalDateHeader: null,
+    renewalDateCellsConverted: 0,
+    emailColumnHeader: null,
+    phoneColumnHeader: null,
     sources: [],
   };
 
@@ -609,6 +630,10 @@ export async function runConsolidatorSection(
 
     // (d) Email duplicate highlighting (first green, subsequent red).
     const emailKey = findRegistryKey(registry, EMAIL_ALIASES);
+    if (emailKey) {
+      sectionResult.emailColumnHeader =
+        registry.headers.get(emailKey) ?? emailKey;
+    }
     if (emailKey && allRows.length > 0) {
       const emailColIdx = registry.keys.indexOf(emailKey);
       const emailDupeMap = new Map<string, number[]>();
@@ -653,6 +678,10 @@ export async function runConsolidatorSection(
       PHONE_ALIASES,
       PHONE_SUBSTRING_FALLBACKS
     );
+    if (phoneKey) {
+      sectionResult.phoneColumnHeader =
+        registry.headers.get(phoneKey) ?? phoneKey;
+    }
     if (phoneKey && allRows.length > 0) {
       const phoneColIdx = registry.keys.indexOf(phoneKey);
       const phoneDupeMap = new Map<string, number[]>();
@@ -694,16 +723,23 @@ export async function runConsolidatorSection(
     //     dates (numberValue + DATE format), then install the four tier
     //     conditional-format rules.
     const renewalKey = findRegistryKey(registry, RENEWAL_DATE_ALIASES);
+    if (renewalKey) {
+      sectionResult.renewalDateHeader =
+        registry.headers.get(renewalKey) ?? renewalKey;
+    }
     if (renewalKey && allRows.length > 0) {
       const renewalColIdx = registry.keys.indexOf(renewalKey);
 
-      // Build one updateCells per parseable date cell. Skip unparseable
-      // cells (they stay as the text we already wrote).
+      // Build one updateCells per parseable date cell. `parseSheetsDateLike`
+      // recognizes both human strings ("21/04/2026", "2026-04-21") and raw
+      // Sheets serial numbers (e.g. "46133" — which is what comes back from
+      // UNFORMATTED_VALUE when the source cell was a real date).
       for (let r = 0; r < allRows.length; r++) {
         const raw = allRows[r].values.get(renewalKey) ?? "";
         if (!raw) continue;
-        const parsed = parseFlexibleDate(raw);
+        const parsed = parseSheetsDateLike(raw);
         if (!parsed) continue;
+        sectionResult.renewalDateCellsConverted++;
         formatRequests.push({
           updateCells: {
             rows: [
@@ -878,6 +914,10 @@ export async function runConsolidatorBatch(
         phoneDuplicateValues: 0,
         phoneDuplicateCells: 0,
         renewalRulesInstalled: false,
+        renewalDateHeader: null,
+        renewalDateCellsConverted: 0,
+        emailColumnHeader: null,
+        phoneColumnHeader: null,
         sources: [],
         error: err instanceof Error ? err.message : "Section failed",
       });

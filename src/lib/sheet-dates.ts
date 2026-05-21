@@ -12,7 +12,7 @@
  * server's local timezone never shifts the result by ±1 day.
  */
 
-const SHEETS_DATE_EPOCH_UTC_MS = Date.UTC(1899, 11, 30);
+export const SHEETS_DATE_EPOCH_UTC_MS = Date.UTC(1899, 11, 30);
 
 export function toSheetsDateSerial(d: Date): number {
   const y = d.getFullYear();
@@ -56,6 +56,39 @@ export function parseFlexibleDate(raw: string): Date | null {
 
   const fallback = new Date(str);
   if (!isNaN(fallback.getTime())) return fallback;
+
+  return null;
+}
+
+/**
+ * Like `parseFlexibleDate` but also recognizes raw Sheets serial numbers
+ * (e.g. "46133" for 2026-04-21).
+ *
+ * Why this matters: when we read cells with `valueRenderOption=UNFORMATTED_VALUE`
+ * (required so phone numbers don't come back in scientific notation), a cell
+ * that was a "real date" in the source sheet comes back as the underlying
+ * serial number — e.g. 46133, not "21/04/2026". Stringifying that gives
+ * "46133" which none of `parseFlexibleDate`'s regexes match, and the
+ * consolidator's renewal-date pass would skip it and leave the cell as
+ * text — defeating the conditional-format rules (their `ISNUMBER` guard
+ * would be false).
+ *
+ * The serial-range guard (25569 ≈ 1970-01-01, 100000 ≈ 2173) keeps random
+ * integers (IDs, phone digit-counts, etc.) from being misread as dates.
+ */
+export function parseSheetsDateLike(raw: string): Date | null {
+  const fromText = parseFlexibleDate(raw);
+  if (fromText) return fromText;
+
+  const trimmed = raw.trim();
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    const serial = parseFloat(trimmed);
+    if (Number.isFinite(serial) && serial > 25569 && serial < 100000) {
+      return new Date(
+        SHEETS_DATE_EPOCH_UTC_MS + Math.floor(serial) * 86400000
+      );
+    }
+  }
 
   return null;
 }
