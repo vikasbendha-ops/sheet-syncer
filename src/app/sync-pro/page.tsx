@@ -283,12 +283,93 @@ export default function SyncProPage() {
     setHasSaved(false);
   }
 
-  // Stubs filled in by Task 12 / 13.
-  function handleRunSection(_idx: number) {
-    void _idx;
+  function validateSection(s: SectionState): string | null {
+    if (!s.name.trim()) return "Section needs a name.";
+    if (!s.masterTabName.trim()) return "Master tab name is required.";
+    if (!s.linkedSheets.length) return "Add at least one linked sheet.";
+    for (let i = 0; i < s.linkedSheets.length; i++) {
+      const l = s.linkedSheets[i];
+      if (!l.url) return `Linked sheet #${i + 1}: URL is required.`;
+      if (!l.nickname.trim())
+        return `Linked sheet #${i + 1}: nickname is required.`;
+      if (!l.tabName)
+        return `Linked sheet #${i + 1}: pick a tab (use Fetch tabs first).`;
+    }
+    return null;
   }
+
+  async function handleRunSection(idx: number) {
+    const section = sections[idx];
+    if (!section) return;
+    const err = validateSection(section);
+    if (err) {
+      setSectionError(section.id, err);
+      return;
+    }
+    setSectionError(section.id, null);
+    setSectionRunning(section.id, true);
+    try {
+      const payload = { sections: [toConfigSection(section)] };
+      const res = await fetch("/api/sync-pro", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setSectionError(section.id, data.error || "Failed to run");
+        return;
+      }
+      const sec = data.sections?.[0];
+      if (sec) setSectionResult(section.id, sec as ProSectionResult);
+    } catch {
+      setSectionError(section.id, "Network error");
+    } finally {
+      setSectionRunning(section.id, false);
+    }
+  }
+
   async function handleRunAll(e: React.FormEvent) {
     e.preventDefault();
+    let anyFailed = false;
+    for (const s of sections) {
+      const err = validateSection(s);
+      if (err) {
+        setSectionError(s.id, err);
+        anyFailed = true;
+      } else {
+        setSectionError(s.id, null);
+      }
+    }
+    if (anyFailed) return;
+    setRunningSections(new Set(sections.map((s) => s.id)));
+    try {
+      const payload = { sections: sections.map(toConfigSection) };
+      const res = await fetch("/api/sync-pro", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const msg = data.error || "Failed to run";
+        for (const s of sections) setSectionError(s.id, msg);
+        return;
+      }
+      const newResults = new Map<string, ProSectionResult>();
+      for (const r of (data.sections ?? []) as ProSectionResult[]) {
+        newResults.set(r.sectionId, r);
+      }
+      setResults((prev) => {
+        const merged = new Map(prev);
+        for (const [k, v] of newResults) merged.set(k, v);
+        return merged;
+      });
+    } catch {
+      for (const s of sections) setSectionError(s.id, "Network error");
+    } finally {
+      setRunningSections(new Set());
+    }
   }
 
   // Silence "unused" warnings on imports referenced only inside future tasks
@@ -676,14 +757,7 @@ function SectionCard({
         </button>
       </div>
 
-      {/* Result panel — filled in Task 13. */}
-      {result && (
-        <div className="border-t border-border pt-4 text-xs text-muted">
-          Last run produced a result (rendering UI lands in Task 13).
-          Cells filled: {result.totalCellsFilled} · Conflicts:{" "}
-          {result.totalConflicts}
-        </div>
-      )}
+      {result && <InlineResult result={result} />}
     </div>
   );
 }
@@ -875,5 +949,167 @@ function AddPropagateColumn({ onAdd }: { onAdd: (name: string) => void }) {
         className="border border-border rounded-md px-2 py-1 text-xs bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary w-24"
       />
     </span>
+  );
+}
+
+// ---------- InlineResult ----------
+
+function InlineResult({ result }: { result: ProSectionResult }) {
+  const failed = !!result.error;
+  const visibleConflicts = result.conflicts.slice(0, 10);
+  const hiddenConflicts = Math.max(
+    0,
+    result.conflicts.length - visibleConflicts.length
+  );
+  return (
+    <div
+      className={`border-t pt-4 ${
+        failed ? "border-danger/30" : "border-border"
+      }`}
+    >
+      <div className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-2 mb-3">
+        <h3 className="font-medium text-sm">Last run</h3>
+        {result.masterSpreadsheetUrl && (
+          <a
+            href={result.masterSpreadsheetUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-sm text-primary hover:underline font-medium"
+          >
+            Open {result.masterTabName} →
+          </a>
+        )}
+      </div>
+
+      {failed && (
+        <p className="text-sm text-danger bg-danger/10 rounded-md px-3 py-2 mb-3">
+          {result.error}
+        </p>
+      )}
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+        <Stat label="Unique emails" value={result.totalUniqueEmails} />
+        <Stat
+          label="Cells filled"
+          value={result.totalCellsFilled}
+          accent="success"
+        />
+        <Stat
+          label="Conflicts"
+          value={result.totalConflicts}
+          accent={result.totalConflicts > 0 ? "danger" : "muted"}
+        />
+        <Stat
+          label="Present In"
+          value={result.presentInWritten ? 1 : 0}
+          accent="muted"
+          hint={result.presentInWritten ? "written" : "skipped"}
+        />
+      </div>
+
+      {result.columnStats.length > 0 && (
+        <div className="mt-3 space-y-1">
+          <p className="text-xs font-medium text-muted uppercase tracking-wide">
+            Per column
+          </p>
+          {result.columnStats.map((c) => (
+            <div
+              key={c.name}
+              className="flex items-center justify-between text-xs py-1 border-b border-border last:border-0"
+            >
+              <code className="font-medium">{c.name}</code>
+              <span className="text-muted">
+                {c.cellsFilled} filled · {c.conflicts} conflict
+                {c.conflicts === 1 ? "" : "s"} · {c.skippedSheets} skipped
+                sheet{c.skippedSheets === 1 ? "" : "s"}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {result.linkedSheets.length > 0 && (
+        <div className="mt-3 space-y-1">
+          <p className="text-xs font-medium text-muted uppercase tracking-wide">
+            Per sheet
+          </p>
+          {result.linkedSheets.map((t, i) => (
+            <div
+              key={i}
+              className="flex flex-col gap-0.5 text-xs py-1 border-b border-border last:border-0"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium">{t.nickname}</span>
+                {t.error ? (
+                  <span className="text-danger">{t.error}</span>
+                ) : (
+                  <span className="text-muted">
+                    {t.rowsRead} rows · {t.emailsFound} emails ·{" "}
+                    {t.cellsFilled} cells filled
+                  </span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {visibleConflicts.length > 0 && (
+        <div className="mt-3 space-y-1">
+          <p className="text-xs font-medium text-muted uppercase tracking-wide">
+            Conflicts (first {visibleConflicts.length})
+          </p>
+          <div className="space-y-1">
+            {visibleConflicts.map((c, i) => (
+              <div
+                key={i}
+                className="text-xs text-muted py-1 border-b border-border last:border-0"
+              >
+                <code className="font-medium">{c.email}</code> ·{" "}
+                <code>{c.column}</code>:{" "}
+                {c.values
+                  .map((v) => `${v.nickname}="${v.value}"`)
+                  .join(" vs ")}
+              </div>
+            ))}
+          </div>
+          {hiddenConflicts > 0 && (
+            <p className="text-[11px] text-muted">
+              … and {hiddenConflicts} more (open the master tab to see all).
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Stat ----------
+
+function Stat({
+  label,
+  value,
+  accent,
+  hint,
+}: {
+  label: string;
+  value: number;
+  accent?: "success" | "danger" | "muted";
+  hint?: string;
+}) {
+  const valueClass =
+    accent === "success"
+      ? "text-success"
+      : accent === "danger"
+        ? "text-danger"
+        : accent === "muted"
+          ? "text-muted"
+          : "text-foreground";
+  return (
+    <div className="bg-background border border-border rounded-md px-3 py-2">
+      <p className="text-xs text-muted">{label}</p>
+      <p className={`text-lg font-semibold ${valueClass}`}>{value}</p>
+      {hint && <p className="text-[10px] text-muted mt-0.5">{hint}</p>}
+    </div>
   );
 }
