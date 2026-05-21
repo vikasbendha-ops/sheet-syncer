@@ -8,6 +8,7 @@ import AuthStatus from "./auth-status";
 const navLinks = [
   { href: "/", label: "Dashboard" },
   { href: "/sheets", label: "Sheets" },
+  { href: "/sync-pro", label: "Sync Pro" },
   { href: "/consolidator", label: "Consolidator" },
   { href: "/duplicate-finder", label: "Duplicate Finder" },
   { href: "/domain-analyzer", label: "Domain Analyzer" },
