@@ -32,6 +32,8 @@ Next.js 16 App Router + React 19 + TypeScript strict. Tailwind v4 via `@tailwind
 - `_config` — linked source sheets for the main sync (`src/lib/config-store.ts`). Columns: `url, nickname, tabName, emailColumn, lastSynced`. `ensureConfigTab` lazily creates this tab and migrates old 4-column schemas to the current 5-column layout on read.
 - `_report_sync_config` — `src/lib/report-config-store.ts`
 - `_biz_tutor_config` — `src/lib/biz-tutor-config-store.ts`
+- `_consolidator_config` — `src/lib/consolidator-config-store.ts`
+- `_sync_pro_config` — `src/lib/sync-pro-config-store.ts`
 - `Master` — output of the main sync (`src/lib/sheets-writer.ts`). Cleared and rewritten in full on each sync.
 - `Domains - <tab>` — output of the domain analyzer.
 
@@ -77,7 +79,9 @@ src/app/api/<feature>/config/route.ts       # GET/PUT config
 src/app/<feature>/page.tsx                  # client UI
 ```
 
-Existing features: main sync (`sync-engine`), `email-finder`, `biz-tutor-sync`, `renewal-sync`, `report-sync`, `domain-analyzer`, `consolidator`, `duplicate-finder`. The main sync is the only one that uses `_config` — the others use their own `_<feature>_config` tab and don't share state.
+Existing features: main sync (`sync-engine`), `email-finder`, `biz-tutor-sync`, `renewal-sync`, `report-sync`, `domain-analyzer`, `consolidator`, `duplicate-finder`, `sync-pro`. The main sync is the only one that uses `_config` — the others use their own `_<feature>_config` tab and don't share state.
+
+`sync-pro` is the multi-section, column-propagation sibling of the basic main sync. Each section has its own linked-sheets list, propagate-columns list, per-sheet column mapping, and master-tab name. Within a section: read every linked sheet, build a cross-reference by lowercased email, then for each logical propagate column fill any blank cell using the non-blank value from another linked sheet (never overwrite an existing non-blank value). Multiple non-blank values that disagree are surfaced in `result.conflicts` rather than touched. After propagation, the existing `writePresentInColumn` helper adds a "Present In" deep-link column to each source sheet (toggleable per section), and the section writes a `[Name, Email, ✅/❌ per sheet]` Master tab into the user's master spreadsheet at `section.masterTabName` (defaults to `Pro: <section name>`). The prefix-folding name-merge logic is duplicated verbatim from `sync-engine.ts` so the basic sync stays 100% untouched. Sections are run independently via per-section `Run section` buttons (or "Run all N sections"); per-section failures don't abort the batch.
 
 `duplicate-finder` is read+format-only (no row writes). Treats all picked tabs of one source spreadsheet as a single dataset, finds duplicates in the `Email` and `Telefono Cellulare` columns, then paints cell backgrounds: first occurrence light green, subsequent occurrences light red. Singletons untouched. Phone matching strips non-digits before comparing (raw value preserved). Re-running clears formatting in just the Email + Phone columns of the picked tabs before repainting. No `_config` tab — scans are one-off, not persisted.
 
