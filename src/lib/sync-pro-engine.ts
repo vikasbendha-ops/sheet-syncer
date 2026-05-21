@@ -152,50 +152,338 @@ function mergeNamesForEmail(namesByEmail: Map<string, string[]>): Map<string, st
 }
 
 // ===========================================================================
-// Per-sheet read + section run will be implemented in subsequent tasks.
+// Read phase
 // ===========================================================================
+
+/** A single read row from one linked sheet, keyed by normalized email. */
+interface SheetRowRecord {
+  /** 1-based row number in the source tab. */
+  rowNumber: number;
+  /** Display name extracted from the sheet's name column(s), if any. */
+  name: string;
+  /**
+   * Map from logical column name → raw cell value (cleaned). Only contains
+   * columns this linked sheet mapped to a real header.
+   */
+  perColumn: Map<string, string>;
+}
+
+interface SheetReadOutcome {
+  result: ProTabResult;
+  /** Resolved Google Sheets numeric sheetId for the picked tab. */
+  sheetId: number;
+  /** Resolved spreadsheetId. */
+  spreadsheetId: string;
+  /** Map<normalizedEmail, SheetRowRecord>. First-seen row wins per email. */
+  byEmail: Map<string, SheetRowRecord>;
+  /**
+   * The actual column index in this sheet for each logical column the
+   * section requested. -1 = not mapped / not found in this sheet.
+   */
+  logicalColIndex: Map<string, number>;
+  /** 0-based index of the email column in this sheet. */
+  emailColIdx: number;
+}
+
+/**
+ * Reads one linked sheet. Resolves the email column (auto-detect or letter),
+ * resolves each mapped logical column to a 0-based index, then bulk-reads
+ * the values via batchGet.
+ */
+async function readLinkedSheet(
+  sheets: sheets_v4.Sheets,
+  linked: ProLinkedSheet,
+  propagateColumns: string[]
+): Promise<SheetReadOutcome> {
+  const tabResult: ProTabResult = {
+    nickname: linked.nickname,
+    url: linked.url,
+    tabName: linked.tabName,
+    rowsRead: 0,
+    emailsFound: 0,
+    cellsFilled: 0,
+  };
+  const byEmail = new Map<string, SheetRowRecord>();
+  const logicalColIndex = new Map<string, number>();
+
+  const spreadsheetId = extractSpreadsheetId(linked.url);
+
+  // Resolve tab + sheetId
+  const meta = await withRetry(() =>
+    sheets.spreadsheets.get({ spreadsheetId })
+  );
+  const allTabs = meta.data.sheets ?? [];
+  const matched = allTabs.find(
+    (t) => t.properties?.title === linked.tabName
+  );
+  const sheetId = matched?.properties?.sheetId ?? -1;
+  const resolvedTab = matched?.properties?.title ?? linked.tabName;
+  if (sheetId < 0) {
+    tabResult.error = `Tab "${linked.tabName}" not found`;
+    return {
+      result: tabResult,
+      sheetId: -1,
+      spreadsheetId,
+      byEmail,
+      logicalColIndex,
+      emailColIdx: -1,
+    };
+  }
+
+  const safeTab = `'${resolvedTab.replace(/'/g, "''")}'`;
+
+  // Read header row to resolve column indices
+  const headerRes = await withRetry(() =>
+    sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${safeTab}!1:1`,
+    })
+  );
+  const headers = (headerRes.data.values?.[0] ?? []).map((h) =>
+    clean(h)
+  );
+
+  // Email column
+  let emailColIdx = letterToIndex(linked.emailColumn);
+  if (emailColIdx < 0) {
+    emailColIdx = findEmailColumnIndex(headers);
+  }
+  if (emailColIdx < 0) {
+    tabResult.error = `No email column found in "${resolvedTab}". Headers: ${headers.filter(Boolean).join(", ")}`;
+    return {
+      result: tabResult,
+      sheetId,
+      spreadsheetId,
+      byEmail,
+      logicalColIndex,
+      emailColIdx: -1,
+    };
+  }
+
+  // Name columns (for the Master tab's Name field)
+  const nameCols = findNameColumns(headers);
+
+  // Logical propagate columns → 0-based column indices (case-insensitive)
+  const normalizedHeaders = headers.map((h) =>
+    h.toLowerCase().trim().replace(/\s+/g, " ")
+  );
+  for (const logical of propagateColumns) {
+    const mapped = linked.columnMapping[logical];
+    if (!mapped) {
+      logicalColIndex.set(logical, -1);
+      continue;
+    }
+    const want = mapped.toLowerCase().trim().replace(/\s+/g, " ");
+    const idx = normalizedHeaders.findIndex((h) => h === want);
+    logicalColIndex.set(logical, idx);
+  }
+
+  // Build batch ranges: email + name columns + every mapped (idx >= 0) logical column
+  const ranges: string[] = [];
+  const rangeForCol = new Map<number, number>(); // col idx → ranges[] index
+  function addColumnRange(colIdx: number) {
+    if (colIdx < 0 || rangeForCol.has(colIdx)) return;
+    rangeForCol.set(colIdx, ranges.length);
+    const letter = columnIndexToLetter(colIdx);
+    ranges.push(`${safeTab}!${letter}2:${letter}`);
+  }
+  addColumnRange(emailColIdx);
+  if (nameCols.fullName !== undefined) addColumnRange(nameCols.fullName);
+  if (nameCols.firstName !== undefined) addColumnRange(nameCols.firstName);
+  if (nameCols.lastName !== undefined) addColumnRange(nameCols.lastName);
+  for (const [, idx] of logicalColIndex) addColumnRange(idx);
+
+  const batchRes = await withRetry(() =>
+    sheets.spreadsheets.values.batchGet({
+      spreadsheetId,
+      ranges,
+      valueRenderOption: "UNFORMATTED_VALUE",
+    })
+  );
+  const valueRanges = batchRes.data.valueRanges ?? [];
+
+  function valuesFor(colIdx: number): unknown[][] {
+    if (colIdx < 0) return [];
+    const ri = rangeForCol.get(colIdx);
+    if (ri === undefined) return [];
+    return (valueRanges[ri]?.values ?? []) as unknown[][];
+  }
+
+  const emailRows = valuesFor(emailColIdx);
+  const fullNameRows =
+    nameCols.fullName !== undefined ? valuesFor(nameCols.fullName) : [];
+  const firstNameRows =
+    nameCols.firstName !== undefined ? valuesFor(nameCols.firstName) : [];
+  const lastNameRows =
+    nameCols.lastName !== undefined ? valuesFor(nameCols.lastName) : [];
+
+  for (let i = 0; i < emailRows.length; i++) {
+    const rawEmail = emailRows[i]?.[0];
+    if (rawEmail === null || rawEmail === undefined || rawEmail === "")
+      continue;
+    tabResult.rowsRead++;
+    const normalized = normalizeEmail(String(rawEmail));
+    if (!normalized) continue;
+    tabResult.emailsFound++;
+
+    // Build display name (same logic as sync-engine reader)
+    const full = clean(fullNameRows[i]?.[0]);
+    const first = clean(firstNameRows[i]?.[0]);
+    const last = clean(lastNameRows[i]?.[0]);
+    let name = "";
+    if (full) {
+      name = full;
+    } else if (first || last) {
+      if (
+        first &&
+        last &&
+        first.toLowerCase() === last.toLowerCase()
+      ) {
+        name = first;
+      } else {
+        name = [first, last].filter(Boolean).join(" ");
+      }
+    }
+
+    // Collect mapped column values
+    const perColumn = new Map<string, string>();
+    for (const [logical, idx] of logicalColIndex) {
+      if (idx < 0) continue;
+      const colRows = valuesFor(idx);
+      const v = clean(colRows[i]?.[0]);
+      if (v) perColumn.set(logical, v);
+    }
+
+    // First-seen row wins per email within a single sheet
+    if (!byEmail.has(normalized)) {
+      byEmail.set(normalized, {
+        rowNumber: i + 2,
+        name,
+        perColumn,
+      });
+    }
+  }
+
+  return {
+    result: tabResult,
+    sheetId,
+    spreadsheetId,
+    byEmail,
+    logicalColIndex,
+    emailColIdx,
+  };
+}
 
 export async function runSyncProSection(
   refreshToken: string,
   masterSheetId: string,
   section: ProSection
 ): Promise<ProSectionResult> {
-  // Placeholder — implemented incrementally over Tasks 5-7.
+  const masterTabName = section.masterTabName || `Pro: ${section.name}`;
   const result: ProSectionResult = {
     sectionId: section.id,
     sectionName: section.name,
     masterSpreadsheetUrl: "",
-    masterTabName: section.masterTabName || `Pro: ${section.name}`,
+    masterTabName,
     totalUniqueEmails: 0,
     totalCellsFilled: 0,
     totalConflicts: 0,
     linkedSheets: [],
-    columnStats: [],
+    columnStats: section.propagateColumns.map((c) => ({
+      name: c.name,
+      cellsFilled: 0,
+      conflicts: 0,
+      skippedSheets: 0,
+    })),
     conflicts: [],
     presentInWritten: false,
-    error: "runSyncProSection: not yet implemented",
   };
-  // Silence unused-import warnings while skeleton compiles.
-  void refreshToken;
-  void masterSheetId;
-  void getSheetsClient;
-  void withRetry;
-  void withConcurrencyLimit;
-  void clean;
-  void letterToIndex;
-  void normalizeEmail;
-  void findEmailColumnIndex;
-  void findNameColumns;
-  void columnIndexToLetter;
-  void extractSpreadsheetId;
+
+  if (!section.linkedSheets.length) {
+    result.error = "Section needs at least one linked sheet.";
+    return result;
+  }
+
+  const sheetsClient = getSheetsClient(refreshToken);
+  const propagateColumnNames = section.propagateColumns.map((c) => c.name);
+
+  // Read every linked sheet in parallel under MAX_CONCURRENCY
+  const readTasks = section.linkedSheets.map(
+    (linked) => async () => {
+      try {
+        return await readLinkedSheet(sheetsClient, linked, propagateColumnNames);
+      } catch (err) {
+        const tabResult: ProTabResult = {
+          nickname: linked.nickname,
+          url: linked.url,
+          tabName: linked.tabName,
+          rowsRead: 0,
+          emailsFound: 0,
+          cellsFilled: 0,
+          error: err instanceof Error ? err.message : "Failed to read sheet",
+        };
+        return {
+          result: tabResult,
+          sheetId: -1,
+          spreadsheetId: "",
+          byEmail: new Map<string, SheetRowRecord>(),
+          logicalColIndex: new Map<string, number>(),
+          emailColIdx: -1,
+        } as SheetReadOutcome;
+      }
+    }
+  );
+  const outcomes = await withConcurrencyLimit(readTasks, MAX_CONCURRENCY);
+  // Preserve config order in the result list
+  outcomes.sort(
+    (a, b) =>
+      section.linkedSheets.findIndex((l) => l.nickname === a.result.nickname) -
+      section.linkedSheets.findIndex((l) => l.nickname === b.result.nickname)
+  );
+
+  result.linkedSheets = outcomes.map((o) => o.result);
+
+  // Skipped-sheets count per logical column (sheets that mapped to null or
+  // whose header lookup failed end up with idx=-1)
+  for (const col of result.columnStats) {
+    col.skippedSheets = outcomes.filter(
+      (o) => (o.logicalColIndex.get(col.name) ?? -1) < 0
+    ).length;
+  }
+
+  // Build cross-reference: email → array of {linkedSheetIdx, sheetId, rowNumber}
+  const crossRef = new Map<
+    string,
+    Array<{
+      linkedSheetIdx: number;
+      sheetId: number;
+      rowNumber: number;
+      spreadsheetId: string;
+    }>
+  >();
+  for (let i = 0; i < outcomes.length; i++) {
+    const o = outcomes[i];
+    for (const [email, record] of o.byEmail) {
+      const list = crossRef.get(email) ?? [];
+      list.push({
+        linkedSheetIdx: i,
+        sheetId: o.sheetId,
+        rowNumber: record.rowNumber,
+        spreadsheetId: o.spreadsheetId,
+      });
+      crossRef.set(email, list);
+    }
+  }
+  result.totalUniqueEmails = crossRef.size;
+
+  // Stash outcomes + crossRef on a local object that subsequent tasks
+  // (propagation + present-in + master tab writes) will consume. For now
+  // we early-return with read stats only; Tasks 6-7 fill in the rest.
+  void crossRef;
   void writePresentInColumn;
   void mergeNamesForEmail;
   void HEADER_BG;
-  void MAX_CONCURRENCY;
-  const _unused: sheets_v4.Sheets | null = null;
-  void _unused;
-  void ({} as ProLinkedSheet);
-  void ({} as ProTabResult);
+  void masterSheetId;
   void ({} as ProColumnStats);
   void ({} as ProConflict);
   return result;
