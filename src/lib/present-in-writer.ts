@@ -11,8 +11,13 @@ export interface PresentInCell {
 }
 
 /**
- * Writes the "Present In" column to a specific tab in a spreadsheet.
+ * Writes a "Present In" column to a specific tab in a spreadsheet.
  * Each cell contains comma-separated nicknames; each nickname is a hyperlink.
+ *
+ * `headerText` defaults to "Present In" so existing callers (basic sync,
+ * Sync Pro) stay byte-identical in behavior. Multi Sync passes its
+ * per-section column name (e.g. "Present In - 3") so each section owns
+ * a uniquely-named column in the source sheet.
  */
 export async function writePresentInColumn(
   refreshToken: string,
@@ -20,7 +25,8 @@ export async function writePresentInColumn(
   sheetId: number,
   columnIndex: number, // 0-based
   headerNeeded: boolean,
-  cellData: PresentInCell[]
+  cellData: PresentInCell[],
+  headerText: string = PRESENT_IN_HEADER
 ): Promise<void> {
   const sheets = getSheetsClient(refreshToken);
 
@@ -33,7 +39,7 @@ export async function writePresentInColumn(
           {
             values: [
               {
-                userEnteredValue: { stringValue: PRESENT_IN_HEADER },
+                userEnteredValue: { stringValue: headerText },
                 userEnteredFormat: { textFormat: { bold: true } },
               },
             ],
