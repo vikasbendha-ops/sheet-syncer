@@ -9,6 +9,7 @@ const navLinks = [
   { href: "/", label: "Dashboard" },
   { href: "/sheets", label: "Sheets" },
   { href: "/sync-pro", label: "Sync Pro" },
+  { href: "/multi-sync", label: "Multi Sync" },
   { href: "/consolidator", label: "Consolidator" },
   { href: "/duplicate-finder", label: "Duplicate Finder" },
   { href: "/domain-analyzer", label: "Domain Analyzer" },
