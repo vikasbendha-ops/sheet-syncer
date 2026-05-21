@@ -12,7 +12,6 @@ import { writePresentInColumn } from "./present-in-writer";
 import { sheets_v4 } from "googleapis";
 import type {
   ProBatchResult,
-  ProConflict,
   ProLinkedSheet,
   ProSection,
   ProSectionResult,
@@ -617,12 +616,213 @@ export async function runSyncProSection(
   }
   await withConcurrencyLimit(writeTasks, MAX_CONCURRENCY);
 
-  // Present In + Master tab writes land in Task 7.
-  void writePresentInColumn;
-  void mergeNamesForEmail;
-  void HEADER_BG;
-  void masterSheetId;
-  void ({} as ProConflict);
+  // ----- Present In write-back (same shape as basic sync) -----
+  if (section.writePresentIn) {
+    const presentInTasks: Array<() => Promise<void>> = [];
+    for (let i = 0; i < outcomes.length; i++) {
+      const outcome = outcomes[i];
+      if (outcome.sheetId < 0) continue;
+      const linked = section.linkedSheets[i];
+      const tabResult = result.linkedSheets[i];
+
+      // Re-read this sheet's headers + presentIn column index (we need the
+      // last filled column index and any existing "Present In" header).
+      const safeTab = `'${linked.tabName.replace(/'/g, "''")}'`;
+      let presentInColumnIndex: number | null = null;
+      let lastColumnIndex = -1;
+      try {
+        const headerRes = await withRetry(() =>
+          sheetsClient.spreadsheets.values.get({
+            spreadsheetId: outcome.spreadsheetId,
+            range: `${safeTab}!1:1`,
+          })
+        );
+        const headers = (headerRes.data.values?.[0] ?? []).map((h) =>
+          clean(h)
+        );
+        for (let c = 0; c < headers.length; c++) {
+          if (headers[c]) lastColumnIndex = c;
+          if (headers[c]?.toLowerCase().trim() === "present in") {
+            presentInColumnIndex = c;
+          }
+        }
+      } catch (err) {
+        tabResult.error = `${tabResult.error ? tabResult.error + "; " : ""}Failed to read headers for Present In: ${err instanceof Error ? err.message : String(err)}`;
+        continue;
+      }
+
+      // Build cell data: every row in this sheet that has cross-refs
+      const cellData: Array<{
+        rowIndex: number; // 0-based
+        links: Array<{ text: string; url: string }>;
+      }> = [];
+      for (const [email, rec] of outcome.byEmail) {
+        const others = (crossRef.get(email) ?? []).filter(
+          (x) => x.linkedSheetIdx !== i
+        );
+        if (others.length === 0) continue;
+        cellData.push({
+          rowIndex: rec.rowNumber - 1,
+          links: others.map((o) => ({
+            text: section.linkedSheets[o.linkedSheetIdx]?.nickname ?? "?",
+            url: `https://docs.google.com/spreadsheets/d/${o.spreadsheetId}/edit#gid=${o.sheetId}&range=A${o.rowNumber}`,
+          })),
+        });
+      }
+
+      const colIdx =
+        presentInColumnIndex !== null
+          ? presentInColumnIndex
+          : lastColumnIndex + 1;
+      const headerNeeded = presentInColumnIndex === null;
+
+      presentInTasks.push(async () => {
+        try {
+          await writePresentInColumn(
+            refreshToken,
+            outcome.spreadsheetId,
+            outcome.sheetId,
+            colIdx,
+            headerNeeded,
+            cellData
+          );
+        } catch (err) {
+          tabResult.error = `${tabResult.error ? tabResult.error + "; " : ""}Failed to write Present In: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      });
+    }
+    await withConcurrencyLimit(presentInTasks, MAX_CONCURRENCY);
+    result.presentInWritten = true;
+  }
+
+  // ----- Master tab write -----
+  try {
+    const masterMeta = await withRetry(() =>
+      sheetsClient.spreadsheets.get({ spreadsheetId: masterSheetId })
+    );
+    const allMasterTabs = masterMeta.data.sheets ?? [];
+    const existing = allMasterTabs.find(
+      (t) => t.properties?.title === masterTabName
+    );
+    let masterSheetIdNumber: number;
+    if (
+      existing?.properties?.sheetId !== undefined &&
+      existing.properties.sheetId !== null
+    ) {
+      masterSheetIdNumber = existing.properties.sheetId;
+    } else {
+      const addRes = await withRetry(() =>
+        sheetsClient.spreadsheets.batchUpdate({
+          spreadsheetId: masterSheetId,
+          requestBody: {
+            requests: [
+              {
+                addSheet: { properties: { title: masterTabName } },
+              },
+            ],
+          },
+        })
+      );
+      masterSheetIdNumber =
+        addRes.data.replies?.[0]?.addSheet?.properties?.sheetId ?? -1;
+      if (masterSheetIdNumber < 0) {
+        throw new Error(`Could not create master tab "${masterTabName}"`);
+      }
+    }
+
+    const safeMaster = `'${masterTabName.replace(/'/g, "''")}'`;
+    await withRetry(() =>
+      sheetsClient.spreadsheets.values.clear({
+        spreadsheetId: masterSheetId,
+        range: `${safeMaster}!A:ZZ`,
+      })
+    );
+
+    // Aggregate names per email across all sheets for prefix-folding merge
+    const namesByEmail = new Map<string, string[]>();
+    for (const o of outcomes) {
+      for (const [email, rec] of o.byEmail) {
+        if (!rec.name) continue;
+        const list = namesByEmail.get(email) ?? [];
+        list.push(rec.name);
+        namesByEmail.set(email, list);
+      }
+    }
+    const mergedNames = mergeNamesForEmail(namesByEmail);
+
+    // Build Master tab values: header + one row per unique email
+    const sortedEmails = Array.from(crossRef.keys()).sort();
+    const headerRow = [
+      "Name",
+      "Email",
+      ...section.linkedSheets.map((l) => l.nickname || l.tabName),
+    ];
+    const dataRows = sortedEmails.map((email) => {
+      const presence = section.linkedSheets.map((_, idx) =>
+        outcomes[idx]?.byEmail.has(email) ? "✅" : "❌"
+      );
+      return [mergedNames.get(email) ?? "", email, ...presence];
+    });
+    const valueRows = [headerRow, ...dataRows];
+    const lastColLetter = columnIndexToLetter(headerRow.length - 1);
+
+    await withRetry(() =>
+      sheetsClient.spreadsheets.values.update({
+        spreadsheetId: masterSheetId,
+        range: `${safeMaster}!A1:${lastColLetter}${valueRows.length}`,
+        valueInputOption: "RAW",
+        requestBody: { values: valueRows },
+      })
+    );
+
+    // Best-effort header styling (don't fail the section if styling errors).
+    try {
+      await withRetry(() =>
+        sheetsClient.spreadsheets.batchUpdate({
+          spreadsheetId: masterSheetId,
+          requestBody: {
+            requests: [
+              {
+                repeatCell: {
+                  range: {
+                    sheetId: masterSheetIdNumber,
+                    startRowIndex: 0,
+                    endRowIndex: 1,
+                    startColumnIndex: 0,
+                    endColumnIndex: headerRow.length,
+                  },
+                  cell: {
+                    userEnteredFormat: {
+                      backgroundColor: HEADER_BG,
+                      textFormat: { bold: true },
+                    },
+                  },
+                  fields:
+                    "userEnteredFormat(backgroundColor,textFormat)",
+                },
+              },
+              {
+                updateSheetProperties: {
+                  properties: {
+                    sheetId: masterSheetIdNumber,
+                    gridProperties: { frozenRowCount: 1 },
+                  },
+                  fields: "gridProperties.frozenRowCount",
+                },
+              },
+            ],
+          },
+        })
+      );
+    } catch {
+      // ignore styling failures
+    }
+
+    result.masterSpreadsheetUrl = `https://docs.google.com/spreadsheets/d/${masterSheetId}/edit#gid=${masterSheetIdNumber}`;
+  } catch (err) {
+    result.error = `${result.error ? result.error + "; " : ""}Failed to write Master tab: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
   return result;
 }
 
