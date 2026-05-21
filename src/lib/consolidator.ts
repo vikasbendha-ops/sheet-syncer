@@ -2,7 +2,6 @@ import { getSheetsClient } from "./google-auth";
 import { withRetry } from "./retry";
 import { normalizeEmail, columnIndexToLetter } from "./email-utils";
 import { extractSpreadsheetId } from "./url-parser";
-import { parseSheetsDateLike, toSheetsDateSerial } from "./sheet-dates";
 import { sheets_v4 } from "googleapis";
 
 /**
@@ -118,6 +117,22 @@ const RENEWAL_DATE_ALIASES = [
   "expiry",
 ];
 
+const SUBSCRIPTION_ALIASES = [
+  "type of subscription",
+  "subscription type",
+  "tipo di abbonamento",
+  "tipo abbonamento",
+  "abbonamento",
+];
+
+const SUBSCRIPTION_OPTIONS = [
+  "BAL",
+  "BAC",
+  "ELITE",
+  "GOLD",
+  "NMM",
+] as const;
+
 export interface ConsolidatorSourceConfig {
   url: string;
   tabs: string[];
@@ -168,6 +183,10 @@ export interface ConsolidatorSectionResult {
   emailColumnHeader: string | null;
   /** Original header text of the detected Phone column, or null. */
   phoneColumnHeader: string | null;
+  /** Original header text of the detected TYPE OF SUBSCRIPTION column, or null. */
+  subscriptionColumnHeader: string | null;
+  /** True if the ONE_OF_LIST dropdown rule was installed on the subscription column. */
+  subscriptionDropdownInstalled: boolean;
   sources: ConsolidatorSourceResult[];
   error?: string;
 }
@@ -452,6 +471,8 @@ export async function runConsolidatorSection(
     renewalDateCellsConverted: 0,
     emailColumnHeader: null,
     phoneColumnHeader: null,
+    subscriptionColumnHeader: null,
+    subscriptionDropdownInstalled: false,
     sources: [],
   };
 
@@ -719,9 +740,13 @@ export async function runConsolidatorSection(
       }
     }
 
-    // (f) Renewal Date column: convert parseable values to real Sheets
-    //     dates (numberValue + DATE format), then install the four tier
-    //     conditional-format rules.
+    // (f) Renewal Date column: re-write JUST this column via a second
+    //     values.update with valueInputOption=USER_ENTERED so Sheets
+    //     natively parses each cell as a date — works for any locale
+    //     format the user might have ("21/04/2026", "2026-04-21",
+    //     "21 April 2026", a raw serial number from UNFORMATTED reads,
+    //     etc.) without us having to handcraft regexes. Then force the
+    //     column's number format to DATE and install the 4 tier rules.
     const renewalKey = findRegistryKey(registry, RENEWAL_DATE_ALIASES);
     if (renewalKey) {
       sectionResult.renewalDateHeader =
@@ -729,52 +754,60 @@ export async function runConsolidatorSection(
     }
     if (renewalKey && allRows.length > 0) {
       const renewalColIdx = registry.keys.indexOf(renewalKey);
+      const renewalColLetter = columnIndexToLetter(renewalColIdx);
 
-      // Build one updateCells per parseable date cell. `parseSheetsDateLike`
-      // recognizes both human strings ("21/04/2026", "2026-04-21") and raw
-      // Sheets serial numbers (e.g. "46133" — which is what comes back from
-      // UNFORMATTED_VALUE when the source cell was a real date).
-      for (let r = 0; r < allRows.length; r++) {
-        const raw = allRows[r].values.get(renewalKey) ?? "";
-        if (!raw) continue;
-        const parsed = parseSheetsDateLike(raw);
-        if (!parsed) continue;
-        sectionResult.renewalDateCellsConverted++;
-        formatRequests.push({
-          updateCells: {
-            rows: [
-              {
-                values: [
-                  {
-                    userEnteredValue: {
-                      numberValue: toSheetsDateSerial(parsed),
-                    },
-                    userEnteredFormat: {
-                      numberFormat: {
-                        type: "DATE",
-                        pattern: "dd/mm/yyyy",
-                      },
-                    },
-                  },
-                ],
-              },
-            ],
-            fields: "userEnteredValue,userEnteredFormat.numberFormat",
-            start: {
-              sheetId: outputSheetId,
-              rowIndex: r + 1,
-              columnIndex: renewalColIdx,
-            },
-          },
-        });
+      // Build the column's values. Empty cells stay empty.
+      const renewalValues = allRows.map((r) => [
+        r.values.get(renewalKey) ?? "",
+      ]);
+      let cellsRewritten = 0;
+      for (const row of renewalValues) {
+        if (row[0]) cellsRewritten++;
       }
 
-      // Install conditional-format rules over every row in the sheet's
-      // grid (covers future rows too).
+      try {
+        await withRetry(() =>
+          sheets.spreadsheets.values.update({
+            spreadsheetId: outputSpreadsheetId,
+            range: `${safeTab}!${renewalColLetter}2:${renewalColLetter}${renewalValues.length + 1}`,
+            valueInputOption: "USER_ENTERED",
+            requestBody: { values: renewalValues },
+          })
+        );
+        // Best-effort: Sheets MAY have left some cells as strings if it
+        // couldn't recognize the date format. We can't easily know which,
+        // so report this as a "rewrite attempted" count, not a guaranteed
+        // success count.
+        sectionResult.renewalDateCellsConverted = cellsRewritten;
+      } catch {
+        // Continue — the conditional rules still install; they just
+        // won't fire on rows where the cell is still a string.
+      }
+
       const sheetRowCount =
         outputTabInfo?.properties?.gridProperties?.rowCount ??
         Math.max(allRows.length + 1, 1000);
-      const renewalColLetter = columnIndexToLetter(renewalColIdx);
+
+      // Apply DATE number format to the entire renewal column so values
+      // render as "dd/mm/yyyy" regardless of how Sheets coerced them.
+      formatRequests.push({
+        repeatCell: {
+          range: {
+            sheetId: outputSheetId,
+            startRowIndex: 1,
+            endRowIndex: sheetRowCount,
+            startColumnIndex: renewalColIdx,
+            endColumnIndex: renewalColIdx + 1,
+          },
+          cell: {
+            userEnteredFormat: {
+              numberFormat: { type: "DATE", pattern: "dd/mm/yyyy" },
+            },
+          },
+          fields: "userEnteredFormat.numberFormat",
+        },
+      });
+
       const ref = `$${renewalColLetter}2`;
       const range: sheets_v4.Schema$GridRange = {
         sheetId: outputSheetId,
@@ -829,6 +862,48 @@ export async function runConsolidatorSection(
       });
 
       sectionResult.renewalRulesInstalled = true;
+    }
+
+    // (g) TYPE OF SUBSCRIPTION dropdown. If the union has the column, install
+    //     a ONE_OF_LIST data validation rule with the 5 canonical values so
+    //     users can pick from the chip dropdown in Sheets. Per-value chip
+    //     colors stay user-managed in the Sheets UI (the API doesn't expose
+    //     reliable per-chip color settings) — once colors are set once they
+    //     persist across re-runs since setDataValidation only overwrites
+    //     the rule, not the cells' chip styling.
+    const subKey = findRegistryKey(registry, SUBSCRIPTION_ALIASES);
+    if (subKey) {
+      sectionResult.subscriptionColumnHeader =
+        registry.headers.get(subKey) ?? subKey;
+
+      const subColIdx = registry.keys.indexOf(subKey);
+      const sheetRowCount =
+        outputTabInfo?.properties?.gridProperties?.rowCount ??
+        Math.max(allRows.length + 1, 1000);
+
+      formatRequests.push({
+        setDataValidation: {
+          range: {
+            sheetId: outputSheetId,
+            startRowIndex: 1, // skip header
+            endRowIndex: sheetRowCount,
+            startColumnIndex: subColIdx,
+            endColumnIndex: subColIdx + 1,
+          },
+          rule: {
+            condition: {
+              type: "ONE_OF_LIST",
+              values: SUBSCRIPTION_OPTIONS.map((v) => ({
+                userEnteredValue: v,
+              })),
+            },
+            strict: true,
+            showCustomUi: true,
+          },
+        },
+      });
+
+      sectionResult.subscriptionDropdownInstalled = true;
     }
 
     // Send all format work in chunked batches.
@@ -918,6 +993,8 @@ export async function runConsolidatorBatch(
         renewalDateCellsConverted: 0,
         emailColumnHeader: null,
         phoneColumnHeader: null,
+        subscriptionColumnHeader: null,
+        subscriptionDropdownInstalled: false,
         sources: [],
         error: err instanceof Error ? err.message : "Section failed",
       });

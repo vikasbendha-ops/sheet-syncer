@@ -35,6 +35,8 @@ interface SectionResult {
   renewalDateCellsConverted: number;
   emailColumnHeader: string | null;
   phoneColumnHeader: string | null;
+  subscriptionColumnHeader: string | null;
+  subscriptionDropdownInstalled: boolean;
   sources: SourceResult[];
   error?: string;
 }
@@ -837,7 +839,7 @@ function InlineResult({ result }: { result: SectionResult }) {
                   </code>{" "}
                   · {result.renewalDateCellsConverted} cell
                   {result.renewalDateCellsConverted === 1 ? "" : "s"}{" "}
-                  converted to real dates
+                  re-written via USER_ENTERED
                   {result.renewalRulesInstalled && (
                     <>
                       {" "}
@@ -852,6 +854,27 @@ function InlineResult({ result }: { result: SectionResult }) {
                 <span className="text-muted">
                   not detected — no conditional formatting applied
                 </span>
+              )}
+            </div>
+            <div>
+              TYPE OF SUBSCRIPTION column:{" "}
+              {result.subscriptionColumnHeader ? (
+                <>
+                  <code className="bg-card px-1 rounded">
+                    {result.subscriptionColumnHeader}
+                  </code>
+                  {result.subscriptionDropdownInstalled && (
+                    <>
+                      {" "}
+                      ·{" "}
+                      <span className="text-success">
+                        dropdown (BAL/BAC/ELITE/GOLD/NMM) installed
+                      </span>
+                    </>
+                  )}
+                </>
+              ) : (
+                <span className="text-muted">not detected</span>
               )}
             </div>
           </div>
